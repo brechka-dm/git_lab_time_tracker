@@ -16,7 +16,9 @@ class AppStorage:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._db_path)
+        connection = sqlite3.connect(self._db_path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
     def _init_db(self) -> None:
         with self._connect() as connection:
@@ -35,6 +37,30 @@ class AppStorage:
                     event_type TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS local_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board_name TEXT NOT NULL,
+                    column_label TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS local_time_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_task_id INTEGER NOT NULL,
+                    started_at REAL NOT NULL,
+                    finished_at REAL NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(local_task_id) REFERENCES local_tasks(id) ON DELETE CASCADE
                 )
                 """
             )
@@ -86,7 +112,9 @@ class AppStorage:
         self._set_value("boards", json.dumps(boards, ensure_ascii=True))
         self._set_value("selected_board", selected_board)
 
-    def load_tracking(self) -> tuple[int | None, str, float | None, int | None, str, int | None, int | None, str]:
+    def load_tracking(
+        self,
+    ) -> tuple[int | None, str, float | None, int | None, str, int | None, int | None, str, bool, int | None]:
         iid_raw = self._get_value("active_issue_iid")
         title = self._get_value("active_issue_title") or ""
         started_raw = self._get_value("active_started_at")
@@ -95,12 +123,16 @@ class AppStorage:
         target_project_raw = self._get_value("active_target_project_id")
         target_iid_raw = self._get_value("active_target_iid")
         target_type = self._get_value("active_target_type") or "issue"
+        is_local_raw = self._get_value("active_is_local")
+        local_task_id_raw = self._get_value("active_local_task_id")
 
         issue_iid: int | None = None
         started_at: float | None = None
         issue_project_id: int | None = None
         target_project_id: int | None = None
         target_iid: int | None = None
+        local_task_id: int | None = None
+        active_is_local = bool(is_local_raw == "1")
         if iid_raw:
             try:
                 value = int(iid_raw)
@@ -128,7 +160,23 @@ class AppStorage:
                 target_iid = int(target_iid_raw)
             except ValueError:
                 pass
-        return issue_iid, title, started_at, issue_project_id, item_type, target_project_id, target_iid, target_type
+        if local_task_id_raw:
+            try:
+                local_task_id = int(local_task_id_raw)
+            except ValueError:
+                pass
+        return (
+            issue_iid,
+            title,
+            started_at,
+            issue_project_id,
+            item_type,
+            target_project_id,
+            target_iid,
+            target_type,
+            active_is_local,
+            local_task_id,
+        )
 
     def save_tracking(
         self,
@@ -140,6 +188,8 @@ class AppStorage:
         target_project_id: int | None,
         target_iid: int | None,
         target_type: str,
+        active_is_local: bool = False,
+        active_local_task_id: int | None = None,
     ) -> None:
         self._set_value("active_issue_iid", "" if issue_iid is None else str(issue_iid))
         self._set_value("active_issue_title", title)
@@ -149,6 +199,101 @@ class AppStorage:
         self._set_value("active_target_project_id", "" if target_project_id is None else str(target_project_id))
         self._set_value("active_target_iid", "" if target_iid is None else str(target_iid))
         self._set_value("active_target_type", target_type)
+        self._set_value("active_is_local", "1" if active_is_local else "0")
+        self._set_value("active_local_task_id", "" if active_local_task_id is None else str(active_local_task_id))
+
+    def load_local_tasks(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, board_name, column_label, title, created_at
+                FROM local_tasks
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        tasks: list[dict] = []
+        for row in rows:
+            tasks.append(
+                {
+                    "task_id": int(row[0]),
+                    "board_name": str(row[1]),
+                    "column_label": str(row[2]),
+                    "title": str(row[3]),
+                    "created_at": float(row[4]),
+                }
+            )
+        return tasks
+
+    def create_local_task(self, board_name: str, column_label: str, title: str) -> dict:
+        now = time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO local_tasks(board_name, column_label, title, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (board_name, column_label, title, now),
+            )
+            connection.commit()
+            task_id = int(cursor.lastrowid)
+        return {
+            "task_id": task_id,
+            "board_name": board_name,
+            "column_label": column_label,
+            "title": title,
+            "created_at": now,
+        }
+
+    def move_local_task(self, task_id: int, board_name: str, column_label: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE local_tasks SET board_name = ?, column_label = ? WHERE id = ?",
+                (board_name, column_label, task_id),
+            )
+            connection.commit()
+
+    def add_local_time_event(self, task_id: int, started_at: float, finished_at: float, duration_seconds: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO local_time_events(local_task_id, started_at, finished_at, duration_seconds, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, started_at, finished_at, duration_seconds, time.time()),
+            )
+            connection.commit()
+
+    def load_local_time_events(self, task_id: int | None = None) -> list[dict]:
+        with self._connect() as connection:
+            if task_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT local_task_id, started_at, finished_at, duration_seconds
+                    FROM local_time_events
+                    ORDER BY finished_at ASC
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT local_task_id, started_at, finished_at, duration_seconds
+                    FROM local_time_events
+                    WHERE local_task_id = ?
+                    ORDER BY finished_at ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
+        events: list[dict] = []
+        for row in rows:
+            events.append(
+                {
+                    "task_id": int(row[0]),
+                    "started_at": float(row[1]),
+                    "finished_at": float(row[2]),
+                    "duration_seconds": int(row[3]),
+                }
+            )
+        return events
 
     def load_issue_orders(self) -> dict[str, list[str]]:
         raw = self._get_value("issue_orders")

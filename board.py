@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from gitlab_client import GitLabClient
-from models import GitLabIssue
+from models import GitLabIssue, LocalTask, local_task_from_payload, local_task_to_payload
 from storage import AppStorage
 
 
@@ -74,6 +74,7 @@ class BoardListWidget(QListWidget):
     show_total_time_requested = Signal(dict)
     show_work_sessions_requested = Signal(dict)
     issue_order_changed = Signal(str, list)
+    add_local_task_requested = Signal(str)
 
     def __init__(self, column_label: str) -> None:
         super().__init__()
@@ -104,6 +105,10 @@ class BoardListWidget(QListWidget):
         sessions_action = QAction("Show work sessions", self)
         sessions_action.triggered.connect(self._show_selected_issue_sessions)
         self.addAction(sessions_action)
+
+        add_local_action = QAction("Add local task here", self)
+        add_local_action.triggered.connect(self._request_add_local_task)
+        self.addAction(add_local_action)
         self.itemDoubleClicked.connect(self._open_issue_link)
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
@@ -132,6 +137,11 @@ class BoardListWidget(QListWidget):
             payload = item.data(Qt.ItemDataRole.UserRole)
             if not isinstance(payload, dict):
                 continue
+            if bool(payload.get("is_local", False)):
+                task_id = int(payload.get("task_id", 0))
+                if task_id > 0:
+                    order.append(f"local:{task_id}")
+                continue
             project_id = int(payload.get("project_id", 0))
             iid = int(payload.get("iid", 0))
             if project_id > 0 and iid > 0:
@@ -141,6 +151,8 @@ class BoardListWidget(QListWidget):
     def _open_issue_link(self, item: QListWidgetItem) -> None:
         payload = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(payload, dict):
+            if bool(payload.get("is_local", False)):
+                return
             web_url = payload.get("web_url", "")
             if web_url:
                 QDesktopServices.openUrl(QUrl(str(web_url)))
@@ -182,6 +194,13 @@ class BoardListWidget(QListWidget):
         payload = selected.data(Qt.ItemDataRole.UserRole)
         if isinstance(payload, dict):
             self.show_work_sessions_requested.emit(payload)
+
+    def _request_add_local_task(self) -> None:
+        self.add_local_task_requested.emit(self._column_label)
+
+    @property
+    def column_label(self) -> str:
+        return self._column_label
 
 
 class BoardColumn(QFrame):
@@ -372,6 +391,10 @@ class SyncThread(QThread):
             except Exception as error:  # noqa: BLE001
                 if _is_retryable_network_error(error):
                     break
+                print(
+                    f"[sync] dropped event #{event_id} ({event_type}): {error}",
+                    flush=True,
+                )
                 self._storage.delete_event(event_id)
         if processed_any:
             self.scan_needed.emit()
@@ -501,6 +524,7 @@ class TrackerWindow(QMainWindow):
         self._client = client
         self._storage = storage
         self._issues_by_iid: dict[tuple[int, int], GitLabIssue] = {}
+        self._local_tasks_by_id: dict[int, LocalTask] = {}
         self._columns: dict[str, BoardColumn] = {}
         self._current_board = self._REVIEW_BOARD_NAME
         self._column_orders_by_board = self._load_board_state()
@@ -519,6 +543,8 @@ class TrackerWindow(QMainWindow):
         self._issue_orders: dict[str, list[str]] = self._storage.load_issue_orders()
         self._today_total_seconds = 0
         self._active_issue_iid: int | None = None
+        self._active_is_local = False
+        self._active_local_task_id: int | None = None
         self._active_issue_project_id: int | None = None
         self._active_item_type = "issue"
         self._active_target_project_id: int | None = None
@@ -574,6 +600,9 @@ class TrackerWindow(QMainWindow):
         add_column_button = QPushButton("Add Column")
         add_column_button.clicked.connect(self._on_add_column)
         actions_row.addWidget(add_column_button)
+        add_local_task_button = QPushButton("Add Local Task")
+        add_local_task_button.clicked.connect(self._on_add_local_task_button)
+        actions_row.addWidget(add_local_task_button)
         actions_row.addStretch()
         root_layout.addLayout(actions_row)
 
@@ -588,6 +617,7 @@ class TrackerWindow(QMainWindow):
         self.setCentralWidget(root)
         self._init_menus()
         self._load_tracking_state()
+        self._load_local_tasks_state()
         self._refresh_tracking_info()
         self._tracking_timer.start()
         self._sync_timer.start()
@@ -672,7 +702,6 @@ class TrackerWindow(QMainWindow):
         self._refresh_thread = None
         self._refresh_in_progress = False
         self._refresh_btn.setEnabled(True)
-        self.statusBar().clearMessage()
 
     def _group_issues(self, issues: list[GitLabIssue]) -> dict[str, list[GitLabIssue]]:
         grouped: dict[str, list[GitLabIssue]] = defaultdict(list)
@@ -690,6 +719,11 @@ class TrackerWindow(QMainWindow):
         # Keep empty columns visible as long as label exists on board.
         for label in self._column_order():
             grouped.setdefault(label, [])
+        for task in self._local_tasks_by_id.values():
+            if task.board_name != self._current_board:
+                continue
+            self._ensure_column_exists(task.board_name, task.column_label)
+            grouped.setdefault(task.column_label, [])
         return grouped
 
     def _rebuild_columns(self, grouped: dict[str, list[GitLabIssue]]) -> None:
@@ -703,7 +737,12 @@ class TrackerWindow(QMainWindow):
         for label in self._column_order():
             if label not in grouped:
                 continue
-            column = BoardColumn(label, self._display_label(label), len(grouped[label]))
+            local_count = sum(
+                1
+                for t in self._local_tasks_by_id.values()
+                if t.board_name == self._current_board and t.column_label == label
+            )
+            column = BoardColumn(label, self._display_label(label), len(grouped[label]) + local_count)
             column.issue_moved.connect(self._on_issue_moved)
             column.move_left_requested.connect(self._move_column_left)
             column.move_right_requested.connect(self._move_column_right)
@@ -713,15 +752,53 @@ class TrackerWindow(QMainWindow):
             column.list_widget.stop_work_requested.connect(self._stop_work_from_payload)
             column.list_widget.show_total_time_requested.connect(self._show_issue_total_time)
             column.list_widget.show_work_sessions_requested.connect(self._show_issue_work_sessions)
+            column.list_widget.add_local_task_requested.connect(self._on_add_local_task_in_column)
             self._columns[label] = column
             self._board_layout.addWidget(column)
 
-            for issue in self._ordered_issues_for_column(label, grouped[label]):
-                card = QListWidgetItem(f"#{issue.iid} {issue.title}")
-                card.setData(Qt.ItemDataRole.UserRole, asdict(issue))
-                column.list_widget.addItem(card)
+            local_for_column = [
+                task
+                for task in self._local_tasks_by_id.values()
+                if task.board_name == self._current_board and task.column_label == label
+            ]
+            for kind, entry in self._merge_column_card_order(label, grouped[label], local_for_column):
+                if kind == "gitlab":
+                    issue = entry
+                    card = QListWidgetItem(f"#{issue.iid} {issue.title}")
+                    issue_payload = asdict(issue)
+                    issue_payload["is_local"] = False
+                    card.setData(Qt.ItemDataRole.UserRole, issue_payload)
+                    column.list_widget.addItem(card)
+                else:
+                    task = entry
+                    local_card = QListWidgetItem(f"LOCAL {task.title}")
+                    local_card.setData(Qt.ItemDataRole.UserRole, local_task_to_payload(task))
+                    column.list_widget.addItem(local_card)
 
     def _on_issue_moved(self, payload: dict, target_label: str) -> None:
+        if bool(payload.get("is_local", False)):
+            if self._current_board == self._REVIEW_BOARD_NAME:
+                self.statusBar().showMessage("Local tasks cannot be placed on the Review board.", 5000)
+                self._rebuild_columns(self._group_issues(self._last_issues))
+                return
+            task = local_task_from_payload(payload)
+            if task is None:
+                return
+            if task.board_name != self._current_board:
+                return
+            if task.column_label == target_label:
+                return
+            self._storage.move_local_task(task.task_id, self._current_board, target_label)
+            self._local_tasks_by_id[task.task_id] = LocalTask(
+                task_id=task.task_id,
+                board_name=self._current_board,
+                column_label=target_label,
+                title=task.title,
+                created_at=task.created_at,
+            )
+            self.statusBar().showMessage("Local task moved", 3000)
+            self._rebuild_columns(self._group_issues(list(self._issues_by_iid.values())))
+            return
         if self._current_board == self._REVIEW_BOARD_NAME:
             return
 
@@ -816,7 +893,32 @@ class TrackerWindow(QMainWindow):
             self._active_target_project_id,
             self._active_target_iid,
             self._active_target_type,
+            self._active_is_local,
+            self._active_local_task_id,
         )
+
+    def _load_local_tasks_state(self) -> None:
+        self._local_tasks_by_id = {}
+        fallback_board = next(
+            (name for name in sorted(self._column_orders_by_board.keys()) if name != self._REVIEW_BOARD_NAME),
+            "TT",
+        )
+        if fallback_board not in self._column_orders_by_board:
+            self._column_orders_by_board[fallback_board] = ["open"]
+        for payload in self._storage.load_local_tasks():
+            task = local_task_from_payload({"is_local": True, **payload})
+            if task is None:
+                continue
+            if task.board_name == self._REVIEW_BOARD_NAME:
+                self._storage.move_local_task(task.task_id, fallback_board, "open")
+                task = LocalTask(
+                    task_id=task.task_id,
+                    board_name=fallback_board,
+                    column_label="open",
+                    title=task.title,
+                    created_at=task.created_at,
+                )
+            self._local_tasks_by_id[task.task_id] = task
 
     def _column_order(self) -> list[str]:
         if self._current_board == self._REVIEW_BOARD_NAME:
@@ -935,6 +1037,21 @@ class TrackerWindow(QMainWindow):
                 self.load_issues()
                 return
 
+        local_to_move = [
+            task
+            for task in self._local_tasks_by_id.values()
+            if task.board_name == self._current_board and task.column_label == label
+        ]
+        for task in local_to_move:
+            self._storage.move_local_task(task.task_id, self._current_board, "open")
+            self._local_tasks_by_id[task.task_id] = LocalTask(
+                task_id=task.task_id,
+                board_name=self._current_board,
+                column_label="open",
+                title=task.title,
+                created_at=task.created_at,
+            )
+
         self._column_orders_by_board[self._current_board] = [
             item for item in self._column_order() if item != label
         ]
@@ -980,24 +1097,81 @@ class TrackerWindow(QMainWindow):
         self._issue_orders[key] = list(order)
         self._storage.save_issue_orders(self._issue_orders)
 
-    def _ordered_issues_for_column(self, column_label: str, issues: list[GitLabIssue]) -> list[GitLabIssue]:
+    def _merge_column_card_order(
+        self,
+        column_label: str,
+        issues: list[GitLabIssue],
+        local_tasks: list[LocalTask],
+    ) -> list[tuple[str, GitLabIssue | LocalTask]]:
+        """Build card sequence for a column using saved order keys (project:iid and local:id)."""
         key = f"{self._current_board}|{column_label}"
         preferred_order = self._issue_orders.get(key, [])
-        if not preferred_order:
-            return issues
-        by_key = {self._issue_key(issue): issue for issue in issues}
-        ordered: list[GitLabIssue] = []
-        seen: set[str] = set()
-        for issue_key in preferred_order:
-            issue = by_key.get(issue_key)
-            if issue is not None:
-                ordered.append(issue)
-                seen.add(issue_key)
+        by_issue_key = {self._issue_key(issue): issue for issue in issues}
+        by_local_id = {task.task_id: task for task in local_tasks}
+        merged: list[tuple[str, GitLabIssue | LocalTask]] = []
+        seen_issues: set[str] = set()
+        seen_local: set[int] = set()
+
+        for token in preferred_order:
+            if token.startswith("local:"):
+                try:
+                    local_id = int(token.split(":", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                task = by_local_id.get(local_id)
+                if task is not None and local_id not in seen_local:
+                    merged.append(("local", task))
+                    seen_local.add(local_id)
+                continue
+            issue = by_issue_key.get(token)
+            if issue is not None and token not in seen_issues:
+                merged.append(("gitlab", issue))
+                seen_issues.add(token)
+
         for issue in issues:
-            issue_key = self._issue_key(issue)
-            if issue_key not in seen:
-                ordered.append(issue)
-        return ordered
+            ik = self._issue_key(issue)
+            if ik not in seen_issues:
+                merged.append(("gitlab", issue))
+                seen_issues.add(ik)
+        for task in sorted(local_tasks, key=lambda item: item.task_id):
+            if task.task_id not in seen_local:
+                merged.append(("local", task))
+                seen_local.add(task.task_id)
+        return merged
+
+    def _on_add_local_task_in_column(self, column_label: str) -> None:
+        self._on_add_local_task_with_column(column_label)
+
+    def _on_add_local_task_button(self) -> None:
+        default_column = "open"
+        focus = QApplication.focusWidget()
+        if isinstance(focus, BoardListWidget):
+            default_column = focus.column_label
+        elif self._current_board != self._REVIEW_BOARD_NAME and self._column_order():
+            default_column = self._column_order()[0]
+        self._on_add_local_task_with_column(default_column)
+
+    def _on_add_local_task_with_column(self, column_label: str) -> None:
+        if self._current_board == self._REVIEW_BOARD_NAME:
+            QMessageBox.information(self, "Review Board", "Local tasks are not supported in Review board.")
+            return
+        title, accepted = QInputDialog.getText(
+            self,
+            "Add Local Task",
+            f"Task title for '{self._current_board}' / '{self._display_label(column_label)}':",
+        )
+        if not accepted:
+            return
+        clean_title = title.strip()
+        if not clean_title:
+            QMessageBox.information(self, "Empty Value", "Task title cannot be empty.")
+            return
+        created = self._storage.create_local_task(self._current_board, column_label, clean_title)
+        task = local_task_from_payload({"is_local": True, **created})
+        if task is None:
+            return
+        self._local_tasks_by_id[task.task_id] = task
+        self._rebuild_columns(self._group_issues(self._last_issues))
 
     @staticmethod
     def _parse_label(label: str) -> tuple[str, str]:
@@ -1017,6 +1191,27 @@ class TrackerWindow(QMainWindow):
         return raw_label
 
     def _start_work_from_payload(self, payload: dict) -> None:
+        if bool(payload.get("is_local", False)):
+            task = local_task_from_payload(payload)
+            if task is None:
+                return
+            if self._active_started_at is not None and (
+                self._active_is_local or self._active_issue_iid is not None
+            ):
+                self._stop_active_work()
+            self._active_is_local = True
+            self._active_local_task_id = task.task_id
+            self._active_issue_iid = None
+            self._active_issue_project_id = None
+            self._active_item_type = "local_task"
+            self._active_target_project_id = None
+            self._active_target_iid = None
+            self._active_target_type = "local_task"
+            self._active_issue_title = task.title
+            self._active_started_at = time.time()
+            self._save_board_state()
+            self._refresh_tracking_info()
+            return
         item_type = str(payload.get("item_type", "issue"))
         item_project_id = int(payload.get("project_id", 0))
         issue_iid = int(payload.get("iid", 0))
@@ -1024,7 +1219,7 @@ class TrackerWindow(QMainWindow):
         if issue_iid <= 0 or not title or item_project_id <= 0:
             return
 
-        if (
+        if self._active_is_local or (
             self._active_issue_iid is not None
             and (
                 self._active_issue_iid != issue_iid
@@ -1047,6 +1242,14 @@ class TrackerWindow(QMainWindow):
         self._refresh_tracking_info()
 
     def _stop_work_from_payload(self, payload: dict) -> None:
+        if bool(payload.get("is_local", False)):
+            task = local_task_from_payload(payload)
+            if task is None:
+                return
+            if not self._active_is_local or self._active_local_task_id != task.task_id:
+                return
+            self._stop_active_work()
+            return
         item_type = str(payload.get("item_type", "issue"))
         item_project_id = int(payload.get("project_id", 0))
         issue_iid = int(payload.get("iid", 0))
@@ -1061,9 +1264,36 @@ class TrackerWindow(QMainWindow):
         self._stop_active_work()
 
     def _stop_active_work(self) -> None:
-        if self._active_issue_iid is not None and self._active_started_at is not None:
+        if self._active_started_at is not None and (
+            self._active_is_local or self._active_issue_iid is not None
+        ):
             finished_at = time.time()
             elapsed_seconds = max(1, int(finished_at - self._active_started_at))
+            if self._active_is_local and self._active_local_task_id is not None:
+                self._storage.add_local_time_event(
+                    self._active_local_task_id,
+                    self._active_started_at,
+                    finished_at,
+                    elapsed_seconds,
+                )
+                self._today_total_seconds += elapsed_seconds
+                self.statusBar().showMessage(
+                    f"Local time saved: {self._format_duration(elapsed_seconds)}",
+                    5000,
+                )
+                self._active_issue_iid = None
+                self._active_is_local = False
+                self._active_local_task_id = None
+                self._active_issue_project_id = None
+                self._active_item_type = "issue"
+                self._active_target_project_id = None
+                self._active_target_iid = None
+                self._active_target_type = "issue"
+                self._active_issue_title = ""
+                self._active_started_at = None
+                self._save_board_state()
+                self._refresh_tracking_info()
+                return
             try:
                 if (
                     self._active_target_project_id is None
@@ -1110,6 +1340,8 @@ class TrackerWindow(QMainWindow):
                         f"Failed to add spent time for issue #{self._active_issue_iid}:\n{error}",
                     )
         self._active_issue_iid = None
+        self._active_is_local = False
+        self._active_local_task_id = None
         self._active_issue_project_id = None
         self._active_item_type = "issue"
         self._active_target_project_id = None
@@ -1122,32 +1354,73 @@ class TrackerWindow(QMainWindow):
 
     def _refresh_tracking_info(self) -> None:
         active_elapsed = 0
-        if self._active_issue_iid is None or self._active_started_at is None:
+        tracking_active = self._active_started_at is not None and (
+            self._active_is_local and self._active_local_task_id is not None
+            or (not self._active_is_local and self._active_issue_iid is not None)
+        )
+        if not tracking_active:
             self._active_issue_label.setText("None")
             self._active_time_label.setText("00:00:00")
         else:
-            current_issue = self._find_issue_by_iid(self._active_issue_iid)
-            if current_issue is not None:
-                self._active_issue_title = current_issue.title
-
-            self._active_issue_label.setText(f"#{self._active_issue_iid} {self._active_issue_title}")
+            if self._active_is_local and self._active_local_task_id is not None:
+                local_task = self._local_tasks_by_id.get(self._active_local_task_id)
+                if local_task is not None:
+                    self._active_issue_title = local_task.title
+                self._active_issue_label.setText(f"LOCAL {self._active_issue_title}")
+            else:
+                current_issue = self._find_issue(
+                    self._active_issue_project_id,
+                    self._active_issue_iid,
+                )
+                if current_issue is not None:
+                    self._active_issue_title = current_issue.title
+                self._active_issue_label.setText(f"#{self._active_issue_iid} {self._active_issue_title}")
             active_elapsed = max(0, int(time.time() - self._active_started_at))
             self._active_time_label.setText(self._format_duration(active_elapsed))
 
         self._today_total_label.setText(self._format_duration(self._today_total_seconds + active_elapsed))
 
     def _load_tracking_state(self) -> None:
-        issue_iid, title, started_at, project_id, item_type, target_project_id, target_iid, target_type = self._storage.load_tracking()
+        (
+            issue_iid,
+            title,
+            started_at,
+            project_id,
+            item_type,
+            target_project_id,
+            target_iid,
+            target_type,
+            active_is_local,
+            active_local_task_id,
+        ) = self._storage.load_tracking()
         self._active_issue_iid = issue_iid
         self._active_issue_title = title
         self._active_started_at = started_at
+        self._active_is_local = active_is_local
+        self._active_local_task_id = active_local_task_id
         self._active_issue_project_id = project_id
         self._active_item_type = item_type
         self._active_target_project_id = target_project_id
         self._active_target_type = target_type
         self._active_target_iid = target_iid
+        if self._active_is_local:
+            self._active_issue_iid = None
 
     def _show_issue_total_time(self, payload: dict) -> None:
+        if bool(payload.get("is_local", False)):
+            task = local_task_from_payload(payload)
+            if task is None:
+                return
+            total_seconds = sum(
+                int(event.get("duration_seconds", 0) or 0)
+                for event in self._storage.load_local_time_events(task.task_id)
+            )
+            QMessageBox.information(
+                self,
+                "Time summary LOCAL",
+                f"{task.title}\n\nTotal spent: {self._format_duration(total_seconds)}",
+            )
+            return
         if str(payload.get("item_type", "issue")) != "issue":
             QMessageBox.information(self, "Time Summary", "Time summary is available only for issues.")
             return
@@ -1175,6 +1448,23 @@ class TrackerWindow(QMainWindow):
         )
 
     def _show_issue_work_sessions(self, payload: dict) -> None:
+        if bool(payload.get("is_local", False)):
+            task = local_task_from_payload(payload)
+            if task is None:
+                return
+            events = self._storage.load_local_time_events(task.task_id)
+            if not events:
+                QMessageBox.information(self, "Work Sessions LOCAL", "No sessions found.")
+                return
+            lines = [f"LOCAL {task.title}", ""]
+            for event in events:
+                finished_at = datetime.fromtimestamp(float(event["finished_at"]))
+                lines.append(
+                    f"{finished_at.strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"{self._format_duration(int(event['duration_seconds']))}"
+                )
+            QMessageBox.information(self, "Work Sessions LOCAL", "\n".join(lines))
+            return
         if str(payload.get("item_type", "issue")) != "issue":
             QMessageBox.information(self, "Work Sessions", "Work sessions are available only for issues.")
             return
@@ -1258,6 +1548,7 @@ class TrackerWindow(QMainWindow):
         progress.setWindowTitle("Daily Report")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        gitlab_failures: list[str] = []
 
         for index, issue in enumerate(report_items, start=1):
             progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(report_items)})...")
@@ -1276,13 +1567,12 @@ class TrackerWindow(QMainWindow):
                     )
                 events = self._spent_events_cache[cache_key]
             except Exception as error:  # noqa: BLE001
-                progress.close()
-                QMessageBox.warning(
-                    self,
-                    "Daily Report",
-                    f"Failed to load spent events for issue #{issue.iid}:\n{error}",
+                gitlab_failures.append(
+                    f"{issue.item_type} project={issue.project_id} iid={issue.iid}: {error}",
                 )
-                return
+                progress.setValue(index)
+                QApplication.processEvents()
+                continue
 
             key = (issue.item_type, issue.project_id, issue.iid)
             issue_totals.setdefault(key, 0)
@@ -1300,15 +1590,27 @@ class TrackerWindow(QMainWindow):
 
         non_zero_items = [(key, seconds) for key, seconds in issue_totals.items() if seconds > 0]
         non_zero_items.sort(key=lambda item: item[1], reverse=True)
+        local_items = self._local_totals_for_day(target_date)
+        local_total = sum(seconds for _, _, seconds in local_items)
         total_seconds = sum(seconds for _, seconds in non_zero_items)
+        total_seconds += local_total
 
         lines = [f"{target_date.isoformat()} | Total: {self._format_duration(total_seconds)}", ""]
-        if not non_zero_items:
+        if not non_zero_items and not local_items:
             lines.append("No tracked time for this date.")
         else:
             for (_item_type, project_id, issue_iid), seconds in non_zero_items:
                 tag = self._PROJECT_TAGS.get(project_id, f"P{project_id}")
                 lines.append(f"{tag} | #{issue_iid} | {self._format_duration(seconds)}")
+        for _task_id, title, seconds in local_items:
+            lines.append(f"LOCAL | {title} | {self._format_duration(seconds)}")
+        if gitlab_failures:
+            lines.extend(["", "GitLab rows omitted due to errors:"])
+            max_notes = 15
+            for msg in gitlab_failures[:max_notes]:
+                lines.append(f"  - {msg}")
+            if len(gitlab_failures) > max_notes:
+                lines.append(f"  ... and {len(gitlab_failures) - max_notes} more")
 
         report_text = "\n".join(lines)
         reports_dir = Path(__file__).resolve().parent / "reports"
@@ -1316,7 +1618,16 @@ class TrackerWindow(QMainWindow):
         report_path = reports_dir / f"daily_report_{target_date.isoformat()}.txt"
         report_path.write_text(report_text, encoding="utf-8")
 
-        QMessageBox.information(self, "Daily Report", f"Report saved to:\n{report_path}")
+        msg = f"Report saved to:\n{report_path}"
+        if gitlab_failures:
+            QMessageBox.warning(
+                self,
+                "Daily Report",
+                f"{msg}\n\nSome GitLab items could not be loaded ({len(gitlab_failures)}). "
+                "Local totals are included; see report file for details.",
+            )
+        else:
+            QMessageBox.information(self, "Daily Report", msg)
 
     def _show_period_report(self) -> None:
         dialog = QDialog(self)
@@ -1359,6 +1670,7 @@ class TrackerWindow(QMainWindow):
         progress.setWindowTitle("Period Report")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        gitlab_failures: list[str] = []
 
         grouped: dict[str, dict[str, int]] = {}
         for index, issue in enumerate(issues, start=1):
@@ -1378,13 +1690,12 @@ class TrackerWindow(QMainWindow):
                     )
                 events = self._spent_events_cache[cache_key]
             except Exception as error:  # noqa: BLE001
-                progress.close()
-                QMessageBox.warning(
-                    self,
-                    "Period Report",
-                    f"Failed to load spent events for issue #{issue.iid}:\n{error}",
+                gitlab_failures.append(
+                    f"{issue.item_type} project={issue.project_id} iid={issue.iid}: {error}",
                 )
-                return
+                progress.setValue(index)
+                QApplication.processEvents()
+                continue
 
             project_tag = self._PROJECT_TAGS.get(issue.project_id, f"P{issue.project_id}")
             per_project = grouped.setdefault(project_tag, {})
@@ -1402,6 +1713,7 @@ class TrackerWindow(QMainWindow):
         progress.close()
 
         total_seconds = 0
+        local_items = self._local_totals_for_period(start_date, end_date)
         lines: list[str] = [f"{start_date.isoformat()} .. {end_date.isoformat()}", ""]
         for project_tag in sorted(grouped.keys()):
             tasks = grouped[project_tag]
@@ -1413,6 +1725,20 @@ class TrackerWindow(QMainWindow):
             for title, seconds in task_items:
                 total_seconds += seconds
                 lines.append(f"{title} | {self._format_duration(seconds)}")
+            lines.append("")
+        if local_items:
+            lines.append("LOCAL")
+            for _task_id, title, seconds in local_items:
+                total_seconds += seconds
+                lines.append(f"LOCAL | {title} | {self._format_duration(seconds)}")
+            lines.append("")
+        if gitlab_failures:
+            lines.extend(["GitLab rows omitted due to errors:"])
+            max_notes = 15
+            for msg in gitlab_failures[:max_notes]:
+                lines.append(f"  - {msg}")
+            if len(gitlab_failures) > max_notes:
+                lines.append(f"  ... and {len(gitlab_failures) - max_notes} more")
             lines.append("")
 
         if total_seconds == 0:
@@ -1426,7 +1752,16 @@ class TrackerWindow(QMainWindow):
         reports_dir.mkdir(exist_ok=True)
         report_path = reports_dir / f"period_report_{start_date.isoformat()}_{end_date.isoformat()}.txt"
         report_path.write_text(report_text, encoding="utf-8")
-        QMessageBox.information(self, "Period Report", f"Report saved to:\n{report_path}")
+        msg = f"Report saved to:\n{report_path}"
+        if gitlab_failures:
+            QMessageBox.warning(
+                self,
+                "Period Report",
+                f"{msg}\n\nSome GitLab items could not be loaded ({len(gitlab_failures)}). "
+                "Local totals are included; see report file for details.",
+            )
+        else:
+            QMessageBox.information(self, "Period Report", msg)
 
     def _load_timelogs_from_gitlab(self, project_id: int, issue_iid: int) -> list[dict]:
         return self._client.get_issue_time_logs(project_id, issue_iid)
@@ -1448,6 +1783,49 @@ class TrackerWindow(QMainWindow):
             items[(item.item_type, item.project_id, item.iid)] = item
         return list(items.values())
 
+    def _local_totals_for_day(self, target_date: date) -> list[tuple[int, str, int]]:
+        totals: dict[int, int] = {}
+        for event in self._storage.load_local_time_events():
+            duration = int(event.get("duration_seconds", 0) or 0)
+            finished_at = float(event.get("finished_at", 0) or 0)
+            if duration <= 0 or finished_at <= 0:
+                continue
+            if datetime.fromtimestamp(finished_at).date() != target_date:
+                continue
+            task_id = int(event["task_id"])
+            totals[task_id] = totals.get(task_id, 0) + duration
+        items: list[tuple[int, str, int]] = []
+        for task_id, seconds in totals.items():
+            if seconds <= 0:
+                continue
+            task = self._local_tasks_by_id.get(task_id)
+            title = task.title if task is not None else f"local task #{task_id}"
+            items.append((task_id, title, seconds))
+        items.sort(key=lambda item: item[2], reverse=True)
+        return items
+
+    def _local_totals_for_period(self, start_date: date, end_date: date) -> list[tuple[int, str, int]]:
+        totals: dict[int, int] = {}
+        for event in self._storage.load_local_time_events():
+            duration = int(event.get("duration_seconds", 0) or 0)
+            finished_at = float(event.get("finished_at", 0) or 0)
+            if duration <= 0 or finished_at <= 0:
+                continue
+            event_date = datetime.fromtimestamp(finished_at).date()
+            if not (start_date <= event_date <= end_date):
+                continue
+            task_id = int(event["task_id"])
+            totals[task_id] = totals.get(task_id, 0) + duration
+        items: list[tuple[int, str, int]] = []
+        for task_id, seconds in totals.items():
+            if seconds <= 0:
+                continue
+            task = self._local_tasks_by_id.get(task_id)
+            title = task.title if task is not None else f"local task #{task_id}"
+            items.append((task_id, title, seconds))
+        items.sort(key=lambda item: item[2], reverse=True)
+        return items
+
     def _resolve_tracking_target(self, item_type: str, project_id: int, item_iid: int) -> tuple[int, int, str]:
         if item_type == "merge_request":
             try:
@@ -1458,22 +1836,6 @@ class TrackerWindow(QMainWindow):
                 pass
             return project_id, item_iid, "merge_request"
         return project_id, item_iid, "issue"
-
-    def _update_today_total(self) -> None:
-        today = datetime.now().date()
-        total = 0
-        for issue in self._report_source_items():
-            cache_key = (issue.item_type, issue.project_id, issue.iid)
-            if cache_key not in self._spent_events_cache:
-                continue
-            for event in self._spent_events_cache[cache_key]:
-                finished_at = self._parse_iso_datetime(event.get("finished_at"))
-                duration = int(event.get("duration_seconds", 0) or 0)
-                if finished_at is None or duration <= 0:
-                    continue
-                if datetime.fromtimestamp(finished_at).date() == today:
-                    total += duration
-        self._today_total_seconds = total
 
     def _start_today_total_scan(self) -> None:
         """Start a background scan of today's spent time across all recently-updated items."""
@@ -1486,6 +1848,9 @@ class TrackerWindow(QMainWindow):
         self._today_scan_day = today_day
         self._today_scan_cache = self._storage.load_today_scan_cache(today_day)
         self._today_total_seconds = sum(int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values())
+        self._today_total_seconds += sum(
+            seconds for _, _, seconds in self._local_totals_for_day(datetime.now().date())
+        )
         self._refresh_tracking_info()
         today = datetime.now().date()
         thread = TodayScanThread(self._client, today, dict(self._today_scan_cache), self)
@@ -1566,11 +1931,10 @@ class TrackerWindow(QMainWindow):
             item_type=issue.item_type,
         )
 
-    def _find_issue_by_iid(self, iid: int) -> GitLabIssue | None:
-        for issue in self._issues_by_iid.values():
-            if issue.iid == iid:
-                return issue
-        return None
+    def _find_issue(self, project_id: int | None, iid: int | None) -> GitLabIssue | None:
+        if project_id is None or iid is None:
+            return None
+        return self._issues_by_iid.get((project_id, iid))
 
     def _is_review_issue(self, issue: GitLabIssue) -> bool:
         current_user_id = self._client.user_id

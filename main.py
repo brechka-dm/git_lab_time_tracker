@@ -13,10 +13,30 @@ from gitlab_client import GitLabClient
 from storage import AppStorage
 
 
+def _exe_dir() -> Path:
+    """Return the directory that contains Tracker.exe (or the script dir during development)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def _find_config(exe_dir: Path) -> Path:
+    """Locate gitlab_access.ini: prefer a copy next to the exe, fall back to _internal."""
+    candidate = exe_dir / "gitlab_access.ini"
+    if candidate.exists():
+        return candidate
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        bundled = Path(sys._MEIPASS) / "gitlab_access.ini"  # noqa: SLF001
+        if bundled.exists():
+            return bundled
+    return candidate
+
+
 def main() -> int:
     """Start desktop app."""
     app = QApplication(sys.argv)
-    config_path = Path(__file__).with_name("gitlab_access.ini")
+    exe_dir = _exe_dir()
+    config_path = _find_config(exe_dir)
 
     try:
         config = load_config(config_path)
@@ -25,7 +45,7 @@ def main() -> int:
         return 1
 
     client = GitLabClient(config)
-    database_path = Path(__file__).with_name("tracker.db")
+    database_path = exe_dir / "tracker.db"
     storage = AppStorage(database_path)
     window = TrackerWindow(client, storage=storage)
     window.show()
