@@ -5,18 +5,13 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import date, datetime
-from pathlib import Path
 import time
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
-    QCalendarWidget,
     QComboBox,
-    QDateEdit,
-    QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -25,13 +20,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QProgressDialog,
     QScrollArea,
-    QSizePolicy,
     QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
-    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -41,24 +31,23 @@ from models import GitLabIssue, LocalTask, local_task_from_payload, local_task_t
 from storage import AppStorage
 
 from .board_column import BoardColumn
+from .board_labels import display_label, parse_label
 from .board_list_widget import BoardListWidget
+from .issue_board_ops import apply_local_move, issue_key
+from .issue_time_dialogs import show_issue_total_time, show_issue_work_sessions
 from .issue_payload import issue_from_dict, issue_to_dict
+from .local_time_totals import local_totals_for_day, local_totals_for_period
 from .network import is_retryable_network_error
 from .refresh_thread import RefreshThread
+from .report_dialogs import run_daily_report, run_period_report
+from .report_source import report_source_items
 from .sync_thread import SyncThread
+from .time_formatting import format_duration
 from .today_scan_thread import TodayScanThread
-from .work_sessions_dialog import WorkSessionsDialog
 
 
 class TrackerWindow(QMainWindow):
     """Main window with board and sync actions."""
-    _PROJECT_TAGS = {
-        1: "RRC",
-        2: "TS",
-        14: "GTE",
-        49: "Metro",
-        54: "Noesis",
-    }
     _REVIEW_BOARD_NAME = "Review"
 
     def __init__(self, client: GitLabClient, storage: AppStorage) -> None:
@@ -228,7 +217,9 @@ class TrackerWindow(QMainWindow):
         self._sync_boards_from_issues(issues)
         grouped = self._group_issues(issues)
         self._rebuild_columns(grouped)
-        self._today_total_seconds = 0
+        # Avoid zeroing today total before scan: if the cached-data scan is still
+        # running, _start_today_total_scan() returns early and _on_scan_item needs
+        # a correct baseline (it does old_total -> new_total deltas).
         self._start_today_total_scan()
         self.statusBar().showMessage(f"Loaded {len(issues)} issues", 5000)
 
@@ -284,7 +275,7 @@ class TrackerWindow(QMainWindow):
                 for t in self._local_tasks_by_id.values()
                 if t.board_name == self._current_board and t.column_label == label
             )
-            column = BoardColumn(label, self._display_label(label), len(grouped[label]) + local_count)
+            column = BoardColumn(label, display_label(label, self._current_board), len(grouped[label]) + local_count)
             column.issue_moved.connect(self._on_issue_moved)
             column.move_left_requested.connect(self._move_column_left)
             column.move_right_requested.connect(self._move_column_right)
@@ -383,7 +374,7 @@ class TrackerWindow(QMainWindow):
                         "current_column": current_column,
                     },
                 )
-                self._issues_by_iid[(current.project_id, current.iid)] = self._apply_local_move(
+                self._issues_by_iid[(current.project_id, current.iid)] = apply_local_move(
                     current,
                     target_label,
                     current_column,
@@ -408,7 +399,7 @@ class TrackerWindow(QMainWindow):
             return "open"
         board_order = self._column_order()
         for label in issue.labels:
-            category, _column_name = self._parse_label(label)
+            category, _column_name = parse_label(label)
             if category != self._current_board:
                 continue
             self._ensure_column_exists(self._current_board, label)
@@ -482,7 +473,7 @@ class TrackerWindow(QMainWindow):
         discovered_categories: set[str] = set()
         for issue in issues:
             for label in issue.labels:
-                category, _column_name = self._parse_label(label)
+                category, _column_name = parse_label(label)
                 discovered_categories.add(category)
                 self._ensure_column_exists(category, label)
         self._ensure_column_exists(self._REVIEW_BOARD_NAME, "open")
@@ -648,7 +639,7 @@ class TrackerWindow(QMainWindow):
         """Build card sequence for a column using saved order keys (project:iid and local:id)."""
         key = f"{self._current_board}|{column_label}"
         preferred_order = self._issue_orders.get(key, [])
-        by_issue_key = {self._issue_key(issue): issue for issue in issues}
+        by_issue_key = {issue_key(issue): issue for issue in issues}
         by_local_id = {task.task_id: task for task in local_tasks}
         merged: list[tuple[str, GitLabIssue | LocalTask]] = []
         seen_issues: set[str] = set()
@@ -671,7 +662,7 @@ class TrackerWindow(QMainWindow):
                 seen_issues.add(token)
 
         for issue in issues:
-            ik = self._issue_key(issue)
+            ik = issue_key(issue)
             if ik not in seen_issues:
                 merged.append(("gitlab", issue))
                 seen_issues.add(ik)
@@ -700,7 +691,7 @@ class TrackerWindow(QMainWindow):
         title, accepted = QInputDialog.getText(
             self,
             "Add Local Task",
-            f"Task title for '{self._current_board}' / '{self._display_label(column_label)}':",
+            f"Task title for '{self._current_board}' / '{display_label(column_label, self._current_board)}':",
         )
         if not accepted:
             return
@@ -714,23 +705,6 @@ class TrackerWindow(QMainWindow):
             return
         self._local_tasks_by_id[task.task_id] = task
         self._rebuild_columns(self._group_issues(self._last_issues))
-
-    @staticmethod
-    def _parse_label(label: str) -> tuple[str, str]:
-        text = label.strip()
-        if ":" in text:
-            category, column_name = text.split(":", 1)
-            category = category.strip() or "Other"
-            return category, (column_name.strip() or text)
-        return "Other", text
-
-    def _display_label(self, raw_label: str) -> str:
-        if raw_label == "open":
-            return "open"
-        category, column_name = self._parse_label(raw_label)
-        if category == self._current_board and column_name:
-            return column_name
-        return raw_label
 
     def _start_work_from_payload(self, payload: dict) -> None:
         if bool(payload.get("is_local", False)):
@@ -820,7 +794,7 @@ class TrackerWindow(QMainWindow):
                 )
                 self._today_total_seconds += elapsed_seconds
                 self.statusBar().showMessage(
-                    f"Local time saved: {self._format_duration(elapsed_seconds)}",
+                    f"Local time saved: {format_duration(elapsed_seconds)}",
                     5000,
                 )
                 self._active_issue_iid = None
@@ -857,7 +831,7 @@ class TrackerWindow(QMainWindow):
                     }
                 )
                 self.statusBar().showMessage(
-                    f"Spent time added to issue #{self._active_issue_iid}: {self._format_duration(elapsed_seconds)}",
+                    f"Spent time added to issue #{self._active_issue_iid}: {format_duration(elapsed_seconds)}",
                     6000,
                 )
             except Exception as error:  # noqa: BLE001
@@ -918,9 +892,9 @@ class TrackerWindow(QMainWindow):
                     self._active_issue_title = current_issue.title
                 self._active_issue_label.setText(f"#{self._active_issue_iid} {self._active_issue_title}")
             active_elapsed = max(0, int(time.time() - self._active_started_at))
-            self._active_time_label.setText(self._format_duration(active_elapsed))
+            self._active_time_label.setText(format_duration(active_elapsed))
 
-        self._today_total_label.setText(self._format_duration(self._today_total_seconds + active_elapsed))
+        self._today_total_label.setText(format_duration(self._today_total_seconds + active_elapsed))
 
     def _load_tracking_state(self) -> None:
         (
@@ -949,361 +923,36 @@ class TrackerWindow(QMainWindow):
             self._active_issue_iid = None
 
     def _show_issue_total_time(self, payload: dict) -> None:
-        if bool(payload.get("is_local", False)):
-            task = local_task_from_payload(payload)
-            if task is None:
-                return
-            total_seconds = sum(
-                int(event.get("duration_seconds", 0) or 0)
-                for event in self._storage.load_local_time_events(task.task_id)
-            )
-            QMessageBox.information(
-                self,
-                "Time summary LOCAL",
-                f"{task.title}\n\nTotal spent: {self._format_duration(total_seconds)}",
-            )
-            return
-        if str(payload.get("item_type", "issue")) != "issue":
-            QMessageBox.information(self, "Time Summary", "Time summary is available only for issues.")
-            return
-        issue_iid = int(payload.get("iid", 0))
-        title = str(payload.get("title", "")).strip()
-        project_id = int(payload.get("project_id", 0))
-        if issue_iid <= 0:
-            return
-        try:
-            stats = self._client.get_issue_time_summary(project_id, issue_iid)
-        except Exception as error:  # noqa: BLE001
-            QMessageBox.warning(self, "GitLab time tracking", f"Failed to load time summary:\n{error}")
-            return
-
-        total_seconds = int(stats.get("total_time_spent", 0) or 0)
-        estimate_seconds = int(stats.get("time_estimate", 0) or 0)
-        QMessageBox.information(
-            self,
-            f"Time summary #{issue_iid}",
-            (
-                f"{title}\n\n"
-                f"Total spent: {self._format_duration(total_seconds)}\n"
-                f"Estimate: {self._format_duration(estimate_seconds)}"
-            ),
-        )
+        show_issue_total_time(self, payload, self._client, self._storage)
 
     def _show_issue_work_sessions(self, payload: dict) -> None:
-        if bool(payload.get("is_local", False)):
-            task = local_task_from_payload(payload)
-            if task is None:
-                return
-            events = self._storage.load_local_time_events(task.task_id)
-            if not events:
-                QMessageBox.information(self, "Work Sessions LOCAL", "No sessions found.")
-                return
-            lines = [f"LOCAL {task.title}", ""]
-            for event in events:
-                finished_at = datetime.fromtimestamp(float(event["finished_at"]))
-                lines.append(
-                    f"{finished_at.strftime('%Y-%m-%d %H:%M:%S')} | "
-                    f"{self._format_duration(int(event['duration_seconds']))}"
-                )
-            QMessageBox.information(self, "Work Sessions LOCAL", "\n".join(lines))
-            return
-        if str(payload.get("item_type", "issue")) != "issue":
-            QMessageBox.information(self, "Work Sessions", "Work sessions are available only for issues.")
-            return
-        issue_iid = int(payload.get("iid", 0))
-        project_id = int(payload.get("project_id", 0))
-        issue_title = str(payload.get("title", "")).strip()
-        if issue_iid <= 0:
-            return
-        try:
-            spent_events = self._load_spent_events_from_gitlab("issue", project_id, issue_iid)
-        except Exception as error:  # noqa: BLE001
-            QMessageBox.warning(self, "GitLab Time Tracking", f"Failed to load work sessions:\n{error}")
-            return
-        if not spent_events:
-            QMessageBox.information(self, f"Work Sessions #{issue_iid}", "No sessions found.")
-            return
-
-        sessions: list[dict[str, float]] = []
-        for event in spent_events:
-            finished_at = self._parse_iso_datetime(event.get("finished_at"))
-            duration = int(event.get("duration_seconds", 0) or 0)
-            if finished_at is None or duration <= 0:
-                continue
-            started_at = finished_at - duration
-            sessions.append(
-                {
-                    "started_at": float(started_at),
-                    "finished_at": float(finished_at),
-                    "duration_seconds": float(duration),
-                }
-            )
-        sessions.sort(key=lambda item: item["started_at"])
-
-        dialog = WorkSessionsDialog(f"#{issue_iid} {issue_title}", sessions, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if not dialog.has_changes():
-            return
-
-        updated_ranges = dialog.get_values()
-        for started, finished in updated_ranges:
-            if finished <= started:
-                QMessageBox.warning(self, "Work Sessions", "End time must be greater than start time.")
-                return
-
-        try:
-            self._client.reset_spent_time("issue", project_id, issue_iid)
-            for started, finished in sorted(updated_ranges):
-                self._client.add_spent_time("issue", project_id, issue_iid, finished - started)
-            cache_key = ("issue", project_id, issue_iid)
-            if cache_key in self._spent_events_cache:
-                del self._spent_events_cache[cache_key]
-            self._start_today_total_scan()
-            self.statusBar().showMessage(f"Work sessions saved for issue #{issue_iid}", 5000)
-        except Exception as error:  # noqa: BLE001
-            QMessageBox.warning(self, "Work Sessions", f"Failed to save sessions:\n{error}")
+        show_issue_work_sessions(
+            self,
+            payload,
+            self._client,
+            self._storage,
+            self._spent_events_cache,
+            self._start_today_total_scan,
+            self.statusBar().showMessage,
+        )
 
     def _show_daily_report(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Daily Report Date")
-        dialog_layout = QVBoxLayout(dialog)
-        calendar = QCalendarWidget(dialog)
-        calendar.setGridVisible(True)
-        dialog_layout.addWidget(calendar)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        dialog_layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        target_qdate = calendar.selectedDate()
-        target_date = datetime(
-            target_qdate.year(),
-            target_qdate.month(),
-            target_qdate.day(),
-        ).date()
-
-        issue_totals: dict[tuple[str, int, int], int] = {}
-        report_items = self._report_source_items()
-        progress = QProgressDialog("Building daily report...", "Cancel", 0, len(report_items), self)
-        progress.setWindowTitle("Daily Report")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        gitlab_failures: list[str] = []
-
-        for index, issue in enumerate(report_items, start=1):
-            progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(report_items)})...")
-            progress.setValue(index - 1)
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                return
-
-            try:
-                cache_key = (issue.item_type, issue.project_id, issue.iid)
-                if cache_key not in self._spent_events_cache:
-                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(
-                        issue.item_type,
-                        issue.project_id,
-                        issue.iid,
-                    )
-                events = self._spent_events_cache[cache_key]
-            except Exception as error:  # noqa: BLE001
-                gitlab_failures.append(
-                    f"{issue.item_type} project={issue.project_id} iid={issue.iid}: {error}",
-                )
-                progress.setValue(index)
-                QApplication.processEvents()
-                continue
-
-            key = (issue.item_type, issue.project_id, issue.iid)
-            issue_totals.setdefault(key, 0)
-            for event in events:
-                finished_at = self._parse_iso_datetime(event.get("finished_at"))
-                duration = int(event.get("duration_seconds", 0) or 0)
-                if finished_at is None or duration <= 0:
-                    continue
-                event_date = datetime.fromtimestamp(finished_at).date()
-                if event_date == target_date:
-                    issue_totals[key] += duration
-            progress.setValue(index)
-            QApplication.processEvents()
-        progress.close()
-
-        non_zero_items = [(key, seconds) for key, seconds in issue_totals.items() if seconds > 0]
-        non_zero_items.sort(key=lambda item: item[1], reverse=True)
-        local_items = self._local_totals_for_day(target_date)
-        local_total = sum(seconds for _, _, seconds in local_items)
-        total_seconds = sum(seconds for _, seconds in non_zero_items)
-        total_seconds += local_total
-
-        lines = [f"{target_date.isoformat()} | Total: {self._format_duration(total_seconds)}", ""]
-        if not non_zero_items and not local_items:
-            lines.append("No tracked time for this date.")
-        else:
-            for (_item_type, project_id, issue_iid), seconds in non_zero_items:
-                tag = self._PROJECT_TAGS.get(project_id, f"P{project_id}")
-                lines.append(f"{tag} | #{issue_iid} | {self._format_duration(seconds)}")
-        for _task_id, title, seconds in local_items:
-            lines.append(f"LOCAL | {title} | {self._format_duration(seconds)}")
-        if gitlab_failures:
-            lines.extend(["", "GitLab rows omitted due to errors:"])
-            max_notes = 15
-            for msg in gitlab_failures[:max_notes]:
-                lines.append(f"  - {msg}")
-            if len(gitlab_failures) > max_notes:
-                lines.append(f"  ... and {len(gitlab_failures) - max_notes} more")
-
-        report_text = "\n".join(lines)
-        reports_dir = Path(__file__).resolve().parents[2] / "reports"
-        reports_dir.mkdir(exist_ok=True)
-        report_path = reports_dir / f"daily_report_{target_date.isoformat()}.txt"
-        report_path.write_text(report_text, encoding="utf-8")
-
-        msg = f"Report saved to:\n{report_path}"
-        if gitlab_failures:
-            QMessageBox.warning(
-                self,
-                "Daily Report",
-                f"{msg}\n\nSome GitLab items could not be loaded ({len(gitlab_failures)}). "
-                "Local totals are included; see report file for details.",
-            )
-        else:
-            QMessageBox.information(self, "Daily Report", msg)
+        run_daily_report(
+            self,
+            report_source_items(self._issues_by_iid, self._review_items),
+            self._spent_events_cache,
+            lambda item_type, project_id, issue_iid: self._load_spent_events_from_gitlab(item_type, project_id, issue_iid),
+            lambda target_date: local_totals_for_day(self._storage, self._local_tasks_by_id, target_date),
+        )
 
     def _show_period_report(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Period Report")
-        layout = QVBoxLayout(dialog)
-
-        from_row = QHBoxLayout()
-        from_row.addWidget(QLabel("From:"))
-        from_date = QDateEdit(dialog)
-        from_date.setCalendarPopup(True)
-        from_date.setDate(datetime.now().date())
-        from_row.addWidget(from_date)
-        layout.addLayout(from_row)
-
-        to_row = QHBoxLayout()
-        to_row.addWidget(QLabel("To:"))
-        to_date = QDateEdit(dialog)
-        to_date.setCalendarPopup(True)
-        to_date.setDate(datetime.now().date())
-        to_row.addWidget(to_date)
-        layout.addLayout(to_row)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        start_qdate = from_date.date()
-        end_qdate = to_date.date()
-        start_date = datetime(start_qdate.year(), start_qdate.month(), start_qdate.day()).date()
-        end_date = datetime(end_qdate.year(), end_qdate.month(), end_qdate.day()).date()
-        if start_date > end_date:
-            QMessageBox.warning(self, "Period Report", "'From' date must be before or equal to 'To' date.")
-            return
-
-        issues = self._report_source_items()
-        progress = QProgressDialog("Building period report...", "Cancel", 0, len(issues), self)
-        progress.setWindowTitle("Period Report")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        gitlab_failures: list[str] = []
-
-        grouped: dict[str, dict[str, int]] = {}
-        for index, issue in enumerate(issues, start=1):
-            progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(issues)})...")
-            progress.setValue(index - 1)
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                return
-
-            try:
-                cache_key = (issue.item_type, issue.project_id, issue.iid)
-                if cache_key not in self._spent_events_cache:
-                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(
-                        issue.item_type,
-                        issue.project_id,
-                        issue.iid,
-                    )
-                events = self._spent_events_cache[cache_key]
-            except Exception as error:  # noqa: BLE001
-                gitlab_failures.append(
-                    f"{issue.item_type} project={issue.project_id} iid={issue.iid}: {error}",
-                )
-                progress.setValue(index)
-                QApplication.processEvents()
-                continue
-
-            project_tag = self._PROJECT_TAGS.get(issue.project_id, f"P{issue.project_id}")
-            per_project = grouped.setdefault(project_tag, {})
-            per_project.setdefault(issue.title, 0)
-            for event in events:
-                finished_at = self._parse_iso_datetime(event.get("finished_at"))
-                duration = int(event.get("duration_seconds", 0) or 0)
-                if finished_at is None or duration <= 0:
-                    continue
-                event_date = datetime.fromtimestamp(finished_at).date()
-                if start_date <= event_date <= end_date:
-                    per_project[issue.title] += duration
-            progress.setValue(index)
-            QApplication.processEvents()
-        progress.close()
-
-        total_seconds = 0
-        local_items = self._local_totals_for_period(start_date, end_date)
-        lines: list[str] = [f"{start_date.isoformat()} .. {end_date.isoformat()}", ""]
-        for project_tag in sorted(grouped.keys()):
-            tasks = grouped[project_tag]
-            task_items = [(title, seconds) for title, seconds in tasks.items() if seconds > 0]
-            if not task_items:
-                continue
-            lines.append(project_tag)
-            task_items.sort(key=lambda item: item[1], reverse=True)
-            for title, seconds in task_items:
-                total_seconds += seconds
-                lines.append(f"{title} | {self._format_duration(seconds)}")
-            lines.append("")
-        if local_items:
-            lines.append("LOCAL")
-            for _task_id, title, seconds in local_items:
-                total_seconds += seconds
-                lines.append(f"LOCAL | {title} | {self._format_duration(seconds)}")
-            lines.append("")
-        if gitlab_failures:
-            lines.extend(["GitLab rows omitted due to errors:"])
-            max_notes = 15
-            for msg in gitlab_failures[:max_notes]:
-                lines.append(f"  - {msg}")
-            if len(gitlab_failures) > max_notes:
-                lines.append(f"  ... and {len(gitlab_failures) - max_notes} more")
-            lines.append("")
-
-        if total_seconds == 0:
-            lines.append("No tracked time for selected period.")
-        else:
-            lines.insert(1, f"Total: {self._format_duration(total_seconds)}")
-            lines.insert(2, "")
-
-        report_text = "\n".join(lines)
-        reports_dir = Path(__file__).resolve().parents[2] / "reports"
-        reports_dir.mkdir(exist_ok=True)
-        report_path = reports_dir / f"period_report_{start_date.isoformat()}_{end_date.isoformat()}.txt"
-        report_path.write_text(report_text, encoding="utf-8")
-        msg = f"Report saved to:\n{report_path}"
-        if gitlab_failures:
-            QMessageBox.warning(
-                self,
-                "Period Report",
-                f"{msg}\n\nSome GitLab items could not be loaded ({len(gitlab_failures)}). "
-                "Local totals are included; see report file for details.",
-            )
-        else:
-            QMessageBox.information(self, "Period Report", msg)
+        run_period_report(
+            self,
+            report_source_items(self._issues_by_iid, self._review_items),
+            self._spent_events_cache,
+            lambda item_type, project_id, issue_iid: self._load_spent_events_from_gitlab(item_type, project_id, issue_iid),
+            lambda start_date, end_date: local_totals_for_period(self._storage, self._local_tasks_by_id, start_date, end_date),
+        )
 
     def _load_timelogs_from_gitlab(self, project_id: int, issue_iid: int) -> list[dict]:
         return self._client.get_issue_time_logs(project_id, issue_iid)
@@ -1316,57 +965,6 @@ class TrackerWindow(QMainWindow):
         since_date: date | None = None,
     ) -> list[dict]:
         return self._client.get_spent_time_events(item_type, project_id, issue_iid, since_date=since_date)
-
-    def _report_source_items(self) -> list[GitLabIssue]:
-        items: dict[tuple[str, int, int], GitLabIssue] = {}
-        for issue in self._issues_by_iid.values():
-            items[(issue.item_type, issue.project_id, issue.iid)] = issue
-        for item in self._review_items:
-            items[(item.item_type, item.project_id, item.iid)] = item
-        return list(items.values())
-
-    def _local_totals_for_day(self, target_date: date) -> list[tuple[int, str, int]]:
-        totals: dict[int, int] = {}
-        for event in self._storage.load_local_time_events():
-            duration = int(event.get("duration_seconds", 0) or 0)
-            finished_at = float(event.get("finished_at", 0) or 0)
-            if duration <= 0 or finished_at <= 0:
-                continue
-            if datetime.fromtimestamp(finished_at).date() != target_date:
-                continue
-            task_id = int(event["task_id"])
-            totals[task_id] = totals.get(task_id, 0) + duration
-        items: list[tuple[int, str, int]] = []
-        for task_id, seconds in totals.items():
-            if seconds <= 0:
-                continue
-            task = self._local_tasks_by_id.get(task_id)
-            title = task.title if task is not None else f"local task #{task_id}"
-            items.append((task_id, title, seconds))
-        items.sort(key=lambda item: item[2], reverse=True)
-        return items
-
-    def _local_totals_for_period(self, start_date: date, end_date: date) -> list[tuple[int, str, int]]:
-        totals: dict[int, int] = {}
-        for event in self._storage.load_local_time_events():
-            duration = int(event.get("duration_seconds", 0) or 0)
-            finished_at = float(event.get("finished_at", 0) or 0)
-            if duration <= 0 or finished_at <= 0:
-                continue
-            event_date = datetime.fromtimestamp(finished_at).date()
-            if not (start_date <= event_date <= end_date):
-                continue
-            task_id = int(event["task_id"])
-            totals[task_id] = totals.get(task_id, 0) + duration
-        items: list[tuple[int, str, int]] = []
-        for task_id, seconds in totals.items():
-            if seconds <= 0:
-                continue
-            task = self._local_tasks_by_id.get(task_id)
-            title = task.title if task is not None else f"local task #{task_id}"
-            items.append((task_id, title, seconds))
-        items.sort(key=lambda item: item[2], reverse=True)
-        return items
 
     def _resolve_tracking_target(self, item_type: str, project_id: int, item_iid: int) -> tuple[int, int, str]:
         if item_type == "merge_request":
@@ -1391,7 +989,12 @@ class TrackerWindow(QMainWindow):
         self._today_scan_cache = self._storage.load_today_scan_cache(today_day)
         self._today_total_seconds = sum(int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values())
         self._today_total_seconds += sum(
-            seconds for _, _, seconds in self._local_totals_for_day(datetime.now().date())
+            seconds
+            for _, _, seconds in local_totals_for_day(
+                self._storage,
+                self._local_tasks_by_id,
+                datetime.now().date(),
+            )
         )
         self._refresh_tracking_info()
         today = datetime.now().date()
@@ -1454,25 +1057,6 @@ class TrackerWindow(QMainWindow):
         """Clear sync thread reference after completion."""
         self._sync_worker_thread = None
 
-    @staticmethod
-    def _apply_local_move(issue: GitLabIssue, target_label: str, current_column: str) -> GitLabIssue:
-        labels = list(issue.labels)
-        if current_column != "open":
-            labels = [label for label in labels if label != current_column]
-        if target_label != "open":
-            labels.append(target_label)
-        labels = list(dict.fromkeys(labels))
-        return GitLabIssue(
-            project_id=issue.project_id,
-            iid=issue.iid,
-            title=issue.title,
-            web_url=issue.web_url,
-            labels=labels,
-            assignee_ids=issue.assignee_ids,
-            reviewer_ids=issue.reviewer_ids,
-            item_type=issue.item_type,
-        )
-
     def _find_issue(self, project_id: int | None, iid: int | None) -> GitLabIssue | None:
         if project_id is None or iid is None:
             return None
@@ -1490,27 +1074,3 @@ class TrackerWindow(QMainWindow):
             return True
         return current_user_id in issue.assignee_ids
 
-    @staticmethod
-    def _parse_iso_datetime(value: object) -> float | None:
-        if not isinstance(value, str):
-            return None
-        text = value.strip()
-        if not text:
-            return None
-        normalized = text.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(normalized).timestamp()
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _format_duration(seconds: int) -> str:
-        value = max(0, int(seconds))
-        hours = value // 3600
-        minutes = (value % 3600) // 60
-        secs = value % 60
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-    @staticmethod
-    def _issue_key(issue: GitLabIssue) -> str:
-        return f"{issue.project_id}:{issue.iid}"

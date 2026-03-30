@@ -8,6 +8,13 @@ import time
 from pathlib import Path
 
 
+def _clean_board_column_labels(values: list) -> list[str]:
+    """Normalize label list: strip, dedupe preserving order, always include open first."""
+    labels = (item.strip() for item in values if isinstance(item, str))
+    unique = [label for label in dict.fromkeys(labels) if label]
+    return ["open", *[label for label in unique if label != "open"]]
+
+
 class AppStorage:
     """Persist board and tracking state in SQLite."""
 
@@ -15,96 +22,22 @@ class AppStorage:
         self._db_path = db_path
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._db_path)
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    def _init_db(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS app_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS event_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS local_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    board_name TEXT NOT NULL,
-                    column_label TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS local_time_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    local_task_id INTEGER NOT NULL,
-                    started_at REAL NOT NULL,
-                    finished_at REAL NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    created_at REAL NOT NULL,
-                    FOREIGN KEY(local_task_id) REFERENCES local_tasks(id) ON DELETE CASCADE
-                )
-                """
-            )
-            connection.commit()
-
-    def _get_value(self, key: str) -> str | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM app_state WHERE key = ?",
-                (key,),
-            ).fetchone()
-        return None if row is None else str(row[0])
-
-    def _set_value(self, key: str, value: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO app_state(key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (key, value),
-            )
-            connection.commit()
-
     def load_boards(self) -> tuple[dict[str, list[str]], str | None]:
         raw_boards = self._get_value("boards")
         raw_selected = self._get_value("selected_board")
-        boards: dict[str, list[str]] = {}
+        payload: dict = {}
         if raw_boards:
             try:
-                payload = json.loads(raw_boards)
+                loaded = json.loads(raw_boards)
+                payload = loaded if isinstance(loaded, dict) else {}
             except Exception:  # noqa: BLE001
                 payload = {}
-            if isinstance(payload, dict):
-                for board_name, labels in payload.items():
-                    if not isinstance(board_name, str) or not isinstance(labels, list):
-                        continue
-                    cleaned = ["open"]
-                    for item in labels:
-                        if isinstance(item, str):
-                            label = item.strip()
-                            if label and label not in cleaned:
-                                cleaned.append(label)
-                    boards[board_name] = cleaned
+
+        boards = {
+            board_name: _clean_board_column_labels(labels)
+            for board_name, labels in payload.items()
+            if isinstance(board_name, str) and isinstance(labels, list)
+        }
         selected = raw_selected.strip() if raw_selected else None
         return boards, selected
 
@@ -396,4 +329,74 @@ class AppStorage:
     def delete_event(self, event_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM event_queue WHERE id = ?", (event_id,))
+            connection.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._db_path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS local_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board_name TEXT NOT NULL,
+                    column_label TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS local_time_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_task_id INTEGER NOT NULL,
+                    started_at REAL NOT NULL,
+                    finished_at REAL NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(local_task_id) REFERENCES local_tasks(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.commit()
+
+    def _get_value(self, key: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def _set_value(self, key: str, value: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_state(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
             connection.commit()
