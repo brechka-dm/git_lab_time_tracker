@@ -4,13 +4,23 @@
 block_cipher = None
 
 a = Analysis(
-    ['main.py'],
+    ['source/main.py'],
     pathex=[],
     binaries=[],
     datas=[
         ('gitlab_access.ini', '.'),
     ],
     hiddenimports=[
+        'board',
+        'board.board_column',
+        'board.board_list_widget',
+        'board.issue_payload',
+        'board.network',
+        'board.refresh_thread',
+        'board.sync_thread',
+        'board.today_scan_thread',
+        'board.tracker_window',
+        'board.work_sessions_dialog',
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',

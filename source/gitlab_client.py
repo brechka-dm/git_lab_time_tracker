@@ -100,90 +100,6 @@ class GitLabClient:
             items.extend(self._fetch_updated_items(project_id, "merge_requests", since_dt))
         return items
 
-    def _fetch_updated_items(self, project_id: int, resource: str, since_iso: str) -> list[GitLabIssue]:
-        url = f"{self._base_url}/projects/{project_id}/{resource}"
-        page = 1
-        items: list[GitLabIssue] = []
-        item_type = "issue" if resource == "issues" else "merge_request"
-        while True:
-            params = {
-                "scope": "all",
-                "updated_after": since_iso,
-                "per_page": 100,
-                "page": page,
-                "order_by": "updated_at",
-                "sort": "desc",
-            }
-            response = self._session.get(url, params=params, timeout=(5, 10))
-            response.raise_for_status()
-            payload = response.json()
-            for item in payload:
-                assignee_ids = [int(user["id"]) for user in item.get("assignees", []) if isinstance(user, dict) and "id" in user]
-                reviewer_ids = [int(user["id"]) for user in item.get("reviewers", []) if isinstance(user, dict) and "id" in user]
-                items.append(
-                    GitLabIssue(
-                        project_id=project_id,
-                        iid=int(item["iid"]),
-                        title=str(item.get("title", "")),
-                        web_url=str(item.get("web_url", "")),
-                        labels=[label.strip() for label in item.get("labels", []) if isinstance(label, str) and label.strip()],
-                        assignee_ids=assignee_ids,
-                        reviewer_ids=reviewer_ids,
-                        item_type=item_type,
-                    )
-                )
-            next_page = response.headers.get("X-Next-Page", "").strip()
-            if not next_page:
-                break
-            page = int(next_page)
-        return items
-
-    def _fetch_project_issues(
-        self,
-        project_id: int,
-        extra_params: dict[str, Any],
-        inferred_reviewer_id: int | None = None,
-    ) -> list[GitLabIssue]:
-        url = f"{self._base_url}/projects/{project_id}/issues"
-        issues: list[GitLabIssue] = []
-        page = 1
-        while True:
-            params: dict[str, Any] = {
-                "state": "opened",
-                "per_page": 100,
-                "order_by": "updated_at",
-                "sort": "desc",
-                "page": page,
-            }
-            params.update(extra_params)
-
-            response = self._session.get(url, params=params, timeout=(5, 10))
-            response.raise_for_status()
-
-            payload = response.json()
-            for item in payload:
-                assignee_ids = [int(user["id"]) for user in item.get("assignees", []) if isinstance(user, dict) and "id" in user]
-                reviewer_ids = [int(user["id"]) for user in item.get("reviewers", []) if isinstance(user, dict) and "id" in user]
-                if inferred_reviewer_id is not None and inferred_reviewer_id not in reviewer_ids:
-                    reviewer_ids.append(inferred_reviewer_id)
-                issues.append(
-                    GitLabIssue(
-                        project_id=project_id,
-                        iid=item["iid"],
-                        title=item["title"],
-                        web_url=item["web_url"],
-                        labels=[label.strip() for label in item.get("labels", []) if label.strip()],
-                        assignee_ids=assignee_ids,
-                        reviewer_ids=reviewer_ids,
-                        item_type="issue",
-                    )
-                )
-            next_page = response.headers.get("X-Next-Page", "").strip()
-            if not next_page:
-                break
-            page = int(next_page)
-        return issues
-
     def move_issue_to_label(
         self,
         issue: GitLabIssue,
@@ -305,6 +221,90 @@ class GitLabClient:
             return None
         return (target_project_id, issue_iid)
 
+    def _fetch_updated_items(self, project_id: int, resource: str, since_iso: str) -> list[GitLabIssue]:
+        url = f"{self._base_url}/projects/{project_id}/{resource}"
+        page = 1
+        items: list[GitLabIssue] = []
+        item_type = "issue" if resource == "issues" else "merge_request"
+        while True:
+            params = {
+                "scope": "all",
+                "updated_after": since_iso,
+                "per_page": 100,
+                "page": page,
+                "order_by": "updated_at",
+                "sort": "desc",
+            }
+            response = self._session.get(url, params=params, timeout=(5, 10))
+            response.raise_for_status()
+            payload = response.json()
+            for item in payload:
+                assignee_ids = [int(user["id"]) for user in item.get("assignees", []) if isinstance(user, dict) and "id" in user]
+                reviewer_ids = [int(user["id"]) for user in item.get("reviewers", []) if isinstance(user, dict) and "id" in user]
+                items.append(
+                    GitLabIssue(
+                        project_id=project_id,
+                        iid=int(item["iid"]),
+                        title=str(item.get("title", "")),
+                        web_url=str(item.get("web_url", "")),
+                        labels=[label.strip() for label in item.get("labels", []) if isinstance(label, str) and label.strip()],
+                        assignee_ids=assignee_ids,
+                        reviewer_ids=reviewer_ids,
+                        item_type=item_type,
+                    )
+                )
+            next_page = response.headers.get("X-Next-Page", "").strip()
+            if not next_page:
+                break
+            page = int(next_page)
+        return items
+
+    def _fetch_project_issues(
+        self,
+        project_id: int,
+        extra_params: dict[str, Any],
+        inferred_reviewer_id: int | None = None,
+    ) -> list[GitLabIssue]:
+        url = f"{self._base_url}/projects/{project_id}/issues"
+        issues: list[GitLabIssue] = []
+        page = 1
+        while True:
+            params: dict[str, Any] = {
+                "state": "opened",
+                "per_page": 100,
+                "order_by": "updated_at",
+                "sort": "desc",
+                "page": page,
+            }
+            params.update(extra_params)
+
+            response = self._session.get(url, params=params, timeout=(5, 10))
+            response.raise_for_status()
+
+            payload = response.json()
+            for item in payload:
+                assignee_ids = [int(user["id"]) for user in item.get("assignees", []) if isinstance(user, dict) and "id" in user]
+                reviewer_ids = [int(user["id"]) for user in item.get("reviewers", []) if isinstance(user, dict) and "id" in user]
+                if inferred_reviewer_id is not None and inferred_reviewer_id not in reviewer_ids:
+                    reviewer_ids.append(inferred_reviewer_id)
+                issues.append(
+                    GitLabIssue(
+                        project_id=project_id,
+                        iid=item["iid"],
+                        title=item["title"],
+                        web_url=item["web_url"],
+                        labels=[label.strip() for label in item.get("labels", []) if label.strip()],
+                        assignee_ids=assignee_ids,
+                        reviewer_ids=reviewer_ids,
+                        item_type="issue",
+                    )
+                )
+            next_page = response.headers.get("X-Next-Page", "").strip()
+            if not next_page:
+                break
+            page = int(next_page)
+        return issues
+
     def _fetch_notes(self, item_type: str, project_id: int, item_iid: int) -> list[dict[str, Any]]:
         notes: list[dict[str, Any]] = []
         page = 1
@@ -353,6 +353,7 @@ def _parse_iso_datetime(value: str) -> datetime | None:
         return datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
 
 def issue_to_dict(issue: GitLabIssue) -> dict[str, Any]:
     """Convert dataclass to serializable dict for Qt item payload."""

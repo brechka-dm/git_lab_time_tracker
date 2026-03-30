@@ -1,4 +1,4 @@
-"""Kanban board UI."""
+"""Main tracker window and board orchestration."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 import time
 
-import requests
-from PySide6.QtCore import Qt, QObject, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
@@ -18,7 +17,6 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QDialog,
     QDialogButtonBox,
-    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -42,470 +40,14 @@ from gitlab_client import GitLabClient
 from models import GitLabIssue, LocalTask, local_task_from_payload, local_task_to_payload
 from storage import AppStorage
 
-
-def _issue_to_dict(issue: GitLabIssue) -> dict:
-    """Serialize GitLabIssue to a plain dict for SQLite caching."""
-    return asdict(issue)
-
-
-def _issue_from_dict(data: dict) -> GitLabIssue | None:
-    """Deserialize a GitLabIssue from a plain dict; return None if data is invalid."""
-    try:
-        return GitLabIssue(
-            project_id=int(data["project_id"]),
-            iid=int(data["iid"]),
-            title=str(data["title"]),
-            web_url=str(data["web_url"]),
-            labels=[str(lbl) for lbl in data.get("labels", [])],
-            assignee_ids=[int(v) for v in data.get("assignee_ids", [])],
-            reviewer_ids=[int(v) for v in data.get("reviewer_ids", [])],
-            item_type=str(data.get("item_type", "issue")),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-class BoardListWidget(QListWidget):
-    """List that accepts dropped issue cards from other columns."""
-
-    issue_moved = Signal(dict, str)
-    start_work_requested = Signal(dict)
-    stop_work_requested = Signal(dict)
-    show_total_time_requested = Signal(dict)
-    show_work_sessions_requested = Signal(dict)
-    issue_order_changed = Signal(str, list)
-    add_local_task_requested = Signal(str)
-
-    def __init__(self, column_label: str) -> None:
-        super().__init__()
-        self._column_label = column_label
-        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
-        self.setDragDropMode(QListWidget.DragDropMode.DragDrop)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
-        open_action = QAction("Open in GitLab", self)
-        open_action.triggered.connect(self._open_selected_issue_link)
-        self.addAction(open_action)
-
-        start_action = QAction("Start work", self)
-        start_action.triggered.connect(self._start_selected_issue_work)
-        self.addAction(start_action)
-
-        stop_action = QAction("Stop work", self)
-        stop_action.triggered.connect(self._stop_selected_issue_work)
-        self.addAction(stop_action)
-
-        total_time_action = QAction("Show total time", self)
-        total_time_action.triggered.connect(self._show_selected_issue_total_time)
-        self.addAction(total_time_action)
-
-        sessions_action = QAction("Show work sessions", self)
-        sessions_action.triggered.connect(self._show_selected_issue_sessions)
-        self.addAction(sessions_action)
-
-        add_local_action = QAction("Add local task here", self)
-        add_local_action.triggered.connect(self._request_add_local_task)
-        self.addAction(add_local_action)
-        self.itemDoubleClicked.connect(self._open_issue_link)
-
-    def dropEvent(self, event) -> None:  # type: ignore[override]
-        source = event.source()
-        dragged_payload = None
-        if isinstance(source, QListWidget):
-            dragged_item = source.currentItem()
-            if dragged_item is not None:
-                payload = dragged_item.data(Qt.ItemDataRole.UserRole)
-                if isinstance(payload, dict):
-                    dragged_payload = payload
-
-        event.setDropAction(Qt.DropAction.MoveAction)
-        super().dropEvent(event)
-        self._emit_order_changed()
-        if source is self:
-            return
-
-        if isinstance(dragged_payload, dict):
-            self.issue_moved.emit(dragged_payload, self._column_label)
-
-    def _emit_order_changed(self) -> None:
-        order: list[str] = []
-        for idx in range(self.count()):
-            item = self.item(idx)
-            payload = item.data(Qt.ItemDataRole.UserRole)
-            if not isinstance(payload, dict):
-                continue
-            if bool(payload.get("is_local", False)):
-                task_id = int(payload.get("task_id", 0))
-                if task_id > 0:
-                    order.append(f"local:{task_id}")
-                continue
-            project_id = int(payload.get("project_id", 0))
-            iid = int(payload.get("iid", 0))
-            if project_id > 0 and iid > 0:
-                order.append(f"{project_id}:{iid}")
-        self.issue_order_changed.emit(self._column_label, order)
-
-    def _open_issue_link(self, item: QListWidgetItem) -> None:
-        payload = item.data(Qt.ItemDataRole.UserRole)
-        if isinstance(payload, dict):
-            if bool(payload.get("is_local", False)):
-                return
-            web_url = payload.get("web_url", "")
-            if web_url:
-                QDesktopServices.openUrl(QUrl(str(web_url)))
-
-    def _open_selected_issue_link(self) -> None:
-        selected = self.currentItem()
-        if selected is None:
-            return
-        self._open_issue_link(selected)
-
-    def _start_selected_issue_work(self) -> None:
-        selected = self.currentItem()
-        if selected is None:
-            return
-        payload = selected.data(Qt.ItemDataRole.UserRole)
-        if isinstance(payload, dict):
-            self.start_work_requested.emit(payload)
-
-    def _stop_selected_issue_work(self) -> None:
-        selected = self.currentItem()
-        if selected is None:
-            return
-        payload = selected.data(Qt.ItemDataRole.UserRole)
-        if isinstance(payload, dict):
-            self.stop_work_requested.emit(payload)
-
-    def _show_selected_issue_total_time(self) -> None:
-        selected = self.currentItem()
-        if selected is None:
-            return
-        payload = selected.data(Qt.ItemDataRole.UserRole)
-        if isinstance(payload, dict):
-            self.show_total_time_requested.emit(payload)
-
-    def _show_selected_issue_sessions(self) -> None:
-        selected = self.currentItem()
-        if selected is None:
-            return
-        payload = selected.data(Qt.ItemDataRole.UserRole)
-        if isinstance(payload, dict):
-            self.show_work_sessions_requested.emit(payload)
-
-    def _request_add_local_task(self) -> None:
-        self.add_local_task_requested.emit(self._column_label)
-
-    @property
-    def column_label(self) -> str:
-        return self._column_label
-
-
-class BoardColumn(QFrame):
-    """Single kanban column with title and task list."""
-
-    issue_moved = Signal(dict, str)
-    move_left_requested = Signal(str)
-    move_right_requested = Signal(str)
-    remove_requested = Signal(str)
-    issue_order_changed = Signal(str, list)
-
-    def __init__(self, label_id: str, title: str, tasks_count: int) -> None:
-        super().__init__()
-        self._label = label_id
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumWidth(260)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-
-        layout = QVBoxLayout(self)
-        header = QLabel(f"{title} ({tasks_count})")
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.setStyleSheet("font-weight: bold;")
-        layout.addWidget(header)
-
-        controls = QHBoxLayout()
-        move_left = QPushButton("←")
-        move_left.setFixedWidth(28)
-        move_left.clicked.connect(lambda: self.move_left_requested.emit(self._label))
-        controls.addWidget(move_left)
-
-        move_right = QPushButton("→")
-        move_right.setFixedWidth(28)
-        move_right.clicked.connect(lambda: self.move_right_requested.emit(self._label))
-        controls.addWidget(move_right)
-
-        remove = QPushButton("×")
-        remove.setFixedWidth(28)
-        remove.setEnabled(label_id != "open")
-        remove.clicked.connect(lambda: self.remove_requested.emit(self._label))
-        controls.addWidget(remove)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        self.list_widget = BoardListWidget(label_id)
-        self.list_widget.issue_moved.connect(self.issue_moved.emit)
-        self.list_widget.issue_order_changed.connect(self.issue_order_changed.emit)
-        layout.addWidget(self.list_widget)
-
-
-class WorkSessionsDialog(QDialog):
-    """Dialog for manual work session correction."""
-
-    def __init__(self, issue_title: str, sessions: list[dict[str, float]], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Work Sessions")
-        self.resize(760, 420)
-        self._original: list[tuple[int, int]] = [
-            (int(item["started_at"]), int(item["finished_at"])) for item in sessions
-        ]
-        self._editors: list[tuple[QTimeEdit, QTimeEdit]] = []
-        self._dates: list[datetime.date] = []
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(issue_title))
-
-        table = QTableWidget(self)
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["Date", "Start", "End"])
-        table.setRowCount(len(sessions))
-        layout.addWidget(table)
-        self._table = table
-
-        for row, item in enumerate(sessions):
-            started = datetime.fromtimestamp(float(item["started_at"]))
-            finished = datetime.fromtimestamp(float(item["finished_at"]))
-            session_date = started.date()
-            self._dates.append(session_date)
-            table.setItem(row, 0, QTableWidgetItem(started.strftime("%Y-%m-%d")))
-
-            start_editor = QTimeEdit(self)
-            start_editor.setDisplayFormat("HH:mm:ss")
-            start_editor.setTime(started.time())
-            table.setCellWidget(row, 1, start_editor)
-
-            end_editor = QTimeEdit(self)
-            end_editor.setDisplayFormat("HH:mm:ss")
-            end_editor.setTime(finished.time())
-            table.setCellWidget(row, 2, end_editor)
-
-            start_editor.timeChanged.connect(self._on_changed)
-            end_editor.timeChanged.connect(self._on_changed)
-            self._editors.append((start_editor, end_editor))
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        self._save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
-        self._save_button.setEnabled(False)
-        layout.addWidget(buttons)
-        self._on_changed()
-
-    def _on_changed(self) -> None:
-        self._save_button.setEnabled(self.has_changes())
-
-    def has_changes(self) -> bool:
-        return self.get_values() != self._original
-
-    def get_values(self) -> list[tuple[int, int]]:
-        values: list[tuple[int, int]] = []
-        for idx, (start_editor, end_editor) in enumerate(self._editors):
-            session_date = self._dates[idx]
-            start_time = start_editor.time()
-            end_time = end_editor.time()
-            started_dt = datetime(
-                session_date.year,
-                session_date.month,
-                session_date.day,
-                start_time.hour(),
-                start_time.minute(),
-                start_time.second(),
-            )
-            finished_dt = datetime(
-                session_date.year,
-                session_date.month,
-                session_date.day,
-                end_time.hour(),
-                end_time.minute(),
-                end_time.second(),
-            )
-            started = int(started_dt.timestamp())
-            finished = int(finished_dt.timestamp())
-            values.append((started, finished))
-        return values
-
-
-def _is_retryable_network_error(error: Exception) -> bool:
-    """Return True for transient network errors that should be retried later."""
-    if isinstance(error, requests.RequestException):
-        if error.response is None:
-            return True
-        return error.response.status_code >= 500
-    return False
-
-
-class SyncThread(QThread):
-    """Background thread that flushes the offline event queue to GitLab."""
-
-    scan_needed = Signal()
-
-    def __init__(self, client: GitLabClient, storage: AppStorage, events: list[dict], parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._client = client
-        self._storage = storage
-        self._events = events
-
-    def run(self) -> None:
-        processed_any = False
-        for event in self._events:
-            event_id = int(event["id"])
-            event_type = str(event["event_type"])
-            payload = event["payload"]
-            try:
-                if event_type == "add_spent_time":
-                    self._client.add_spent_time(
-                        str(payload.get("item_type", "issue")),
-                        int(payload["project_id"]),
-                        int(payload["iid"]),
-                        int(payload["spent_seconds"]),
-                    )
-                elif event_type == "move_issue":
-                    issue = GitLabIssue(
-                        project_id=int(payload["project_id"]),
-                        iid=int(payload["iid"]),
-                        title=str(payload["title"]),
-                        web_url=str(payload["web_url"]),
-                        labels=[str(lbl) for lbl in payload.get("labels", [])],
-                        assignee_ids=[int(v) for v in payload.get("assignee_ids", [])],
-                        reviewer_ids=[int(v) for v in payload.get("reviewer_ids", [])],
-                        item_type=str(payload.get("item_type", "issue")),
-                    )
-                    self._client.move_issue_to_label(
-                        issue=issue,
-                        target_label=str(payload["target_label"]),
-                        current_column=str(payload["current_column"]),
-                    )
-                self._storage.delete_event(event_id)
-                processed_any = True
-            except Exception as error:  # noqa: BLE001
-                if _is_retryable_network_error(error):
-                    break
-                print(
-                    f"[sync] dropped event #{event_id} ({event_type}): {error}",
-                    flush=True,
-                )
-                self._storage.delete_event(event_id)
-        if processed_any:
-            self.scan_needed.emit()
-
-
-class RefreshThread(QThread):
-    """Background thread that fetches open issues and review MRs from GitLab."""
-
-    result = Signal(list, list)
-    error = Signal(str)
-
-    def __init__(self, client: GitLabClient, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._client = client
-
-    def run(self) -> None:
-        import sys  # noqa: PLC0415
-        started = time.perf_counter()
-        try:
-            t0 = time.perf_counter()
-            issues = self._client.fetch_open_issues()
-            t1 = time.perf_counter()
-            review_mrs = self._client.fetch_review_merge_requests()
-            t2 = time.perf_counter()
-            print(
-                f"[refresh] open_issues={t1 - t0:.3f}s ({len(issues)}), "
-                f"review_mrs={t2 - t1:.3f}s ({len(review_mrs)}), total={t2 - started:.3f}s",
-                flush=True, file=sys.stderr,
-            )
-            self.result.emit(issues, review_mrs)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[refresh] failed after {time.perf_counter() - started:.3f}s: {exc}", flush=True, file=sys.stderr)
-            self.error.emit(str(exc))
-
-
-class TodayScanThread(QThread):
-    """Background thread that scans today's spent time across all recently-updated items."""
-
-    item_scanned = Signal(str, int, int, list, int, bool)
-
-    def __init__(self, client: GitLabClient, today: date, cached: dict[str, dict[str, float]], parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._client = client
-        self._today = today
-        self._cached = cached
-
-    def run(self) -> None:
-        started = time.perf_counter()
-        try:
-            candidates = self._client.fetch_items_updated_since(self._today)
-        except Exception:  # noqa: BLE001
-            print(f"[today_scan] candidates load failed after {time.perf_counter() - started:.3f}s")
-            self.finished.emit()
-            return
-        t_candidates = time.perf_counter()
-        dedup: dict[tuple[str, int, int], GitLabIssue] = {}
-        for item in candidates:
-            dedup[(item.item_type, item.project_id, item.iid)] = item
-        stale_items: list[GitLabIssue] = []
-        now_ts = time.time()
-        for item in dedup.values():
-            cache_key = f"{item.item_type}:{item.project_id}:{item.iid}"
-            cached_entry = self._cached.get(cache_key)
-            if cached_entry is None:
-                stale_items.append(item)
-                continue
-            cached_ts = float(cached_entry.get("ts", 0.0))
-            cached_total = int(cached_entry.get("total", 0) or 0)
-            if now_ts - cached_ts <= 300:
-                self.item_scanned.emit(item.item_type, item.project_id, item.iid, [], cached_total, True)
-            else:
-                stale_items.append(item)
-
-        for item in stale_items:
-            result = self._fetch_item_total(item)
-            if result is not None:
-                self.item_scanned.emit(*result, False)
-        import sys  # noqa: PLC0415
-        print(
-            f"[today_scan] candidates={len(candidates)} dedup={len(dedup)} stale={len(stale_items)} "
-            f"load_candidates={t_candidates - started:.3f}s total={time.perf_counter() - started:.3f}s",
-            flush=True, file=sys.stderr,
-        )
-
-    def _fetch_item_total(self, item: GitLabIssue) -> tuple[str, int, int, list, int] | None:
-        """Fetch spent events for one item and compute today's total seconds."""
-        try:
-            events = self._client.get_spent_time_events(
-                item.item_type, item.project_id, item.iid, since_date=self._today
-            )
-            item_total = sum(
-                int(event.get("duration_seconds", 0) or 0)
-                for event in events
-                if self._is_today_event(event)
-            )
-            return (item.item_type, item.project_id, item.iid, events, item_total)
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _is_today_event(self, event: dict) -> bool:
-        """Return True if the event's finished_at timestamp falls on today's date."""
-        finished_str = event.get("finished_at")
-        if not isinstance(finished_str, str):
-            return False
-        if int(event.get("duration_seconds", 0) or 0) <= 0:
-            return False
-        normalized = finished_str.strip().replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(normalized).date() == self._today
-        except ValueError:
-            return False
+from .board_column import BoardColumn
+from .board_list_widget import BoardListWidget
+from .issue_payload import issue_from_dict, issue_to_dict
+from .network import is_retryable_network_error
+from .refresh_thread import RefreshThread
+from .sync_thread import SyncThread
+from .today_scan_thread import TodayScanThread
+from .work_sessions_dialog import WorkSessionsDialog
 
 
 class TrackerWindow(QMainWindow):
@@ -639,8 +181,8 @@ class TrackerWindow(QMainWindow):
 
         cached = self._storage.load_issues_cache()
         if cached is not None:
-            cached_issues = [i for d in cached[0] if (i := _issue_from_dict(d)) is not None]
-            cached_mrs = [i for d in cached[1] if (i := _issue_from_dict(d)) is not None]
+            cached_issues = [i for d in cached[0] if (i := issue_from_dict(d)) is not None]
+            cached_mrs = [i for d in cached[1] if (i := issue_from_dict(d)) is not None]
             self._apply_cached(cached_issues, cached_mrs)
 
         self._refresh_in_progress = True
@@ -676,8 +218,8 @@ class TrackerWindow(QMainWindow):
         self._refresh_btn.setEnabled(True)
         self.statusBar().clearMessage()
         self._storage.save_issues_cache(
-            [_issue_to_dict(i) for i in issues],
-            [_issue_to_dict(i) for i in review_mrs],
+            [issue_to_dict(i) for i in issues],
+            [issue_to_dict(i) for i in review_mrs],
         )
         self._last_issues = issues
         self._review_items = review_mrs
@@ -825,7 +367,7 @@ class TrackerWindow(QMainWindow):
                 current_column=current_column,
             )
         except Exception as error:  # noqa: BLE001
-            if _is_retryable_network_error(error):
+            if is_retryable_network_error(error):
                 self._storage.enqueue_event(
                     "move_issue",
                     {
@@ -1016,7 +558,7 @@ class TrackerWindow(QMainWindow):
                     current_column=label,
                 )
             except Exception as error:  # noqa: BLE001
-                if _is_retryable_network_error(error):
+                if is_retryable_network_error(error):
                     self._storage.enqueue_event(
                         "move_issue",
                         {
@@ -1319,7 +861,7 @@ class TrackerWindow(QMainWindow):
                     6000,
                 )
             except Exception as error:  # noqa: BLE001
-                if _is_retryable_network_error(error):
+                if is_retryable_network_error(error):
                     self._storage.enqueue_event(
                         "add_spent_time",
                         {
@@ -1613,7 +1155,7 @@ class TrackerWindow(QMainWindow):
                 lines.append(f"  ... and {len(gitlab_failures) - max_notes} more")
 
         report_text = "\n".join(lines)
-        reports_dir = Path(__file__).resolve().parent / "reports"
+        reports_dir = Path(__file__).resolve().parents[2] / "reports"
         reports_dir.mkdir(exist_ok=True)
         report_path = reports_dir / f"daily_report_{target_date.isoformat()}.txt"
         report_path.write_text(report_text, encoding="utf-8")
@@ -1748,7 +1290,7 @@ class TrackerWindow(QMainWindow):
             lines.insert(2, "")
 
         report_text = "\n".join(lines)
-        reports_dir = Path(__file__).resolve().parent / "reports"
+        reports_dir = Path(__file__).resolve().parents[2] / "reports"
         reports_dir.mkdir(exist_ok=True)
         report_path = reports_dir / f"period_report_{start_date.isoformat()}_{end_date.isoformat()}.txt"
         report_path.write_text(report_text, encoding="utf-8")
