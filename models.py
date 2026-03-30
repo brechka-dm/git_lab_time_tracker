@@ -16,3 +16,4 @@ class GitLabIssue:
     labels: list[str]
     assignee_ids: list[int]
     reviewer_ids: list[int]
+    item_type: str = "issue"

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import time
 
 import requests
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -295,6 +295,174 @@ class WorkSessionsDialog(QDialog):
         return values
 
 
+def _is_retryable_network_error(error: Exception) -> bool:
+    """Return True for transient network errors that should be retried later."""
+    if isinstance(error, requests.RequestException):
+        if error.response is None:
+            return True
+        return error.response.status_code >= 500
+    return False
+
+
+class SyncThread(QThread):
+    """Background thread that flushes the offline event queue to GitLab."""
+
+    scan_needed = Signal()
+
+    def __init__(self, client: GitLabClient, storage: AppStorage, events: list[dict], parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._storage = storage
+        self._events = events
+
+    def run(self) -> None:
+        processed_any = False
+        for event in self._events:
+            event_id = int(event["id"])
+            event_type = str(event["event_type"])
+            payload = event["payload"]
+            try:
+                if event_type == "add_spent_time":
+                    self._client.add_spent_time(
+                        str(payload.get("item_type", "issue")),
+                        int(payload["project_id"]),
+                        int(payload["iid"]),
+                        int(payload["spent_seconds"]),
+                    )
+                elif event_type == "move_issue":
+                    issue = GitLabIssue(
+                        project_id=int(payload["project_id"]),
+                        iid=int(payload["iid"]),
+                        title=str(payload["title"]),
+                        web_url=str(payload["web_url"]),
+                        labels=[str(lbl) for lbl in payload.get("labels", [])],
+                        assignee_ids=[int(v) for v in payload.get("assignee_ids", [])],
+                        reviewer_ids=[int(v) for v in payload.get("reviewer_ids", [])],
+                        item_type=str(payload.get("item_type", "issue")),
+                    )
+                    self._client.move_issue_to_label(
+                        issue=issue,
+                        target_label=str(payload["target_label"]),
+                        current_column=str(payload["current_column"]),
+                    )
+                self._storage.delete_event(event_id)
+                processed_any = True
+            except Exception as error:  # noqa: BLE001
+                if _is_retryable_network_error(error):
+                    break
+                self._storage.delete_event(event_id)
+        if processed_any:
+            self.scan_needed.emit()
+
+
+class RefreshThread(QThread):
+    """Background thread that fetches open issues and review MRs from GitLab."""
+
+    result = Signal(list, list)
+    error = Signal(str)
+
+    def __init__(self, client: GitLabClient, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        import sys  # noqa: PLC0415
+        started = time.perf_counter()
+        try:
+            t0 = time.perf_counter()
+            issues = self._client.fetch_open_issues()
+            t1 = time.perf_counter()
+            review_mrs = self._client.fetch_review_merge_requests()
+            t2 = time.perf_counter()
+            print(
+                f"[refresh] open_issues={t1 - t0:.3f}s ({len(issues)}), "
+                f"review_mrs={t2 - t1:.3f}s ({len(review_mrs)}), total={t2 - started:.3f}s",
+                flush=True, file=sys.stderr,
+            )
+            self.result.emit(issues, review_mrs)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[refresh] failed after {time.perf_counter() - started:.3f}s: {exc}", flush=True, file=sys.stderr)
+            self.error.emit(str(exc))
+
+
+class TodayScanThread(QThread):
+    """Background thread that scans today's spent time across all recently-updated items."""
+
+    item_scanned = Signal(str, int, int, list, int, bool)
+
+    def __init__(self, client: GitLabClient, today: date, cached: dict[str, dict[str, float]], parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._today = today
+        self._cached = cached
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            candidates = self._client.fetch_items_updated_since(self._today)
+        except Exception:  # noqa: BLE001
+            print(f"[today_scan] candidates load failed after {time.perf_counter() - started:.3f}s")
+            self.finished.emit()
+            return
+        t_candidates = time.perf_counter()
+        dedup: dict[tuple[str, int, int], GitLabIssue] = {}
+        for item in candidates:
+            dedup[(item.item_type, item.project_id, item.iid)] = item
+        stale_items: list[GitLabIssue] = []
+        now_ts = time.time()
+        for item in dedup.values():
+            cache_key = f"{item.item_type}:{item.project_id}:{item.iid}"
+            cached_entry = self._cached.get(cache_key)
+            if cached_entry is None:
+                stale_items.append(item)
+                continue
+            cached_ts = float(cached_entry.get("ts", 0.0))
+            cached_total = int(cached_entry.get("total", 0) or 0)
+            if now_ts - cached_ts <= 300:
+                self.item_scanned.emit(item.item_type, item.project_id, item.iid, [], cached_total, True)
+            else:
+                stale_items.append(item)
+
+        for item in stale_items:
+            result = self._fetch_item_total(item)
+            if result is not None:
+                self.item_scanned.emit(*result, False)
+        import sys  # noqa: PLC0415
+        print(
+            f"[today_scan] candidates={len(candidates)} dedup={len(dedup)} stale={len(stale_items)} "
+            f"load_candidates={t_candidates - started:.3f}s total={time.perf_counter() - started:.3f}s",
+            flush=True, file=sys.stderr,
+        )
+
+    def _fetch_item_total(self, item: GitLabIssue) -> tuple[str, int, int, list, int] | None:
+        """Fetch spent events for one item and compute today's total seconds."""
+        try:
+            events = self._client.get_spent_time_events(
+                item.item_type, item.project_id, item.iid, since_date=self._today
+            )
+            item_total = sum(
+                int(event.get("duration_seconds", 0) or 0)
+                for event in events
+                if self._is_today_event(event)
+            )
+            return (item.item_type, item.project_id, item.iid, events, item_total)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _is_today_event(self, event: dict) -> bool:
+        """Return True if the event's finished_at timestamp falls on today's date."""
+        finished_str = event.get("finished_at")
+        if not isinstance(finished_str, str):
+            return False
+        if int(event.get("duration_seconds", 0) or 0) <= 0:
+            return False
+        normalized = finished_str.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized).date() == self._today
+        except ValueError:
+            return False
+
+
 class TrackerWindow(QMainWindow):
     """Main window with board and sync actions."""
     _PROJECT_TAGS = {
@@ -315,10 +483,25 @@ class TrackerWindow(QMainWindow):
         self._current_board = self._REVIEW_BOARD_NAME
         self._column_orders_by_board = self._load_board_state()
         self._last_issues: list[GitLabIssue] = []
-        self._spent_events_cache: dict[tuple[int, int], list[dict]] = {}
+        self._review_items: list[GitLabIssue] = []
+        self._spent_events_cache: dict[tuple[str, int, int], list[dict]] = {}
+        self._today_scan_total_seconds = 0
+        self._refresh_thread: QThread | None = None
+        self._refresh_in_progress = False
+        self._sync_worker_thread: SyncThread | None = None
+        self._scan_thread: QThread | None = None
+        self._current_scan_worker: TodayScanThread | None = None
+        self._scan_restart_requested = False
+        self._today_scan_cache: dict[str, dict[str, float]] = {}
+        self._today_scan_day = ""
         self._issue_orders: dict[str, list[str]] = self._storage.load_issue_orders()
         self._today_total_seconds = 0
         self._active_issue_iid: int | None = None
+        self._active_issue_project_id: int | None = None
+        self._active_item_type = "issue"
+        self._active_target_project_id: int | None = None
+        self._active_target_iid: int | None = None
+        self._active_target_type = "issue"
         self._active_issue_title = ""
         self._active_started_at: float | None = None
         self._tracking_timer = QTimer(self)
@@ -355,9 +538,9 @@ class TrackerWindow(QMainWindow):
 
         refresh_row = QHBoxLayout()
         actions_row = QHBoxLayout()
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.load_issues)
-        refresh_row.addWidget(refresh_button)
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.clicked.connect(self.load_issues)
+        refresh_row.addWidget(self._refresh_btn)
         refresh_row.addStretch()
         root_layout.addLayout(refresh_row)
 
@@ -399,30 +582,65 @@ class TrackerWindow(QMainWindow):
 
     def load_issues(self) -> None:
         """Load board data from GitLab and redraw columns."""
-        self._sync_pending_events()
-        try:
-            issues = self._client.fetch_open_issues()
-        except Exception as error:  # noqa: BLE001
-            QMessageBox.critical(self, "GitLab error", f"Failed to load issues:\n{error}")
+        if self._refresh_in_progress:
             return
 
+        self._refresh_in_progress = True
+        self._refresh_btn.setEnabled(False)
+        self.statusBar().showMessage("Refreshing from GitLab…")
+
+        thread = RefreshThread(self._client, self)
+        thread.result.connect(self._apply_refresh)
+        thread.error.connect(self._on_refresh_error)
+        thread.finished.connect(self._on_refresh_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._refresh_thread = thread
+        thread.start()
+
+    def _apply_refresh(
+        self,
+        issues: list[GitLabIssue],
+        review_mrs: list[GitLabIssue],
+    ) -> None:
+        """Apply loaded issues to the UI (called in the UI thread via queued connection)."""
+        self._refresh_in_progress = False
+        self._refresh_btn.setEnabled(True)
+        self.statusBar().clearMessage()
         self._last_issues = issues
+        self._review_items = review_mrs
         self._issues_by_iid = {(issue.project_id, issue.iid): issue for issue in issues}
         self._spent_events_cache.clear()
         self._sync_boards_from_issues(issues)
         grouped = self._group_issues(issues)
         self._rebuild_columns(grouped)
-        self._update_today_total()
+        self._today_total_seconds = 0
+        self._start_today_total_scan()
         self.statusBar().showMessage(f"Loaded {len(issues)} issues", 5000)
+
+    def _on_refresh_error(self, error: str) -> None:
+        """Handle a refresh failure (called in the UI thread via queued connection)."""
+        self._refresh_in_progress = False
+        self._refresh_btn.setEnabled(True)
+        self.statusBar().clearMessage()
+        QMessageBox.critical(self, "GitLab error", f"Failed to load issues:\n{error}")
+
+    def _on_refresh_finished(self) -> None:
+        """Drop thread reference after refresh completion."""
+        self._refresh_thread = None
+        self._refresh_in_progress = False
+        self._refresh_btn.setEnabled(True)
+        self.statusBar().clearMessage()
 
     def _group_issues(self, issues: list[GitLabIssue]) -> dict[str, list[GitLabIssue]]:
         grouped: dict[str, list[GitLabIssue]] = defaultdict(list)
         if self._current_board == self._REVIEW_BOARD_NAME:
-            grouped["open"] = [issue for issue in issues if self._is_review_issue(issue)]
+            grouped["open"] = [issue for issue in self._review_items if self._is_review_issue(issue)]
             return grouped
 
         self._ensure_column_exists(self._current_board, "open")
         for issue in issues:
+            if not self._is_assignee_issue(issue):
+                continue
             column_label = self._resolve_column(issue)
             grouped[column_label].append(issue)
 
@@ -472,6 +690,7 @@ class TrackerWindow(QMainWindow):
             labels=[str(label) for label in payload.get("labels", [])],
             assignee_ids=[int(value) for value in payload.get("assignee_ids", [])],
             reviewer_ids=[int(value) for value in payload.get("reviewer_ids", [])],
+            item_type=str(payload.get("item_type", "issue")),
         )
 
         current = self._issues_by_iid.get((issue.project_id, issue.iid), issue)
@@ -486,7 +705,7 @@ class TrackerWindow(QMainWindow):
                 current_column=current_column,
             )
         except Exception as error:  # noqa: BLE001
-            if self._is_retryable_error(error):
+            if _is_retryable_network_error(error):
                 self._storage.enqueue_event(
                     "move_issue",
                     {
@@ -497,6 +716,7 @@ class TrackerWindow(QMainWindow):
                         "labels": current.labels,
                         "assignee_ids": current.assignee_ids,
                         "reviewer_ids": current.reviewer_ids,
+                        "item_type": current.item_type,
                         "target_label": target_label,
                         "current_column": current_column,
                     },
@@ -544,7 +764,16 @@ class TrackerWindow(QMainWindow):
 
     def _save_board_state(self) -> None:
         self._storage.save_boards(self._column_orders_by_board, self._current_board)
-        self._storage.save_tracking(self._active_issue_iid, self._active_issue_title, self._active_started_at)
+        self._storage.save_tracking(
+            self._active_issue_iid,
+            self._active_issue_title,
+            self._active_started_at,
+            self._active_issue_project_id,
+            self._active_item_type,
+            self._active_target_project_id,
+            self._active_target_iid,
+            self._active_target_type,
+        )
 
     def _column_order(self) -> list[str]:
         if self._current_board == self._REVIEW_BOARD_NAME:
@@ -642,7 +871,7 @@ class TrackerWindow(QMainWindow):
                     current_column=label,
                 )
             except Exception as error:  # noqa: BLE001
-                if self._is_retryable_error(error):
+                if _is_retryable_network_error(error):
                     self._storage.enqueue_event(
                         "move_issue",
                         {
@@ -653,6 +882,7 @@ class TrackerWindow(QMainWindow):
                             "labels": issue.labels,
                             "assignee_ids": issue.assignee_ids,
                             "reviewer_ids": issue.reviewer_ids,
+                            "item_type": issue.item_type,
                             "target_label": "open",
                             "current_column": label,
                         },
@@ -744,25 +974,46 @@ class TrackerWindow(QMainWindow):
         return raw_label
 
     def _start_work_from_payload(self, payload: dict) -> None:
+        item_type = str(payload.get("item_type", "issue"))
+        item_project_id = int(payload.get("project_id", 0))
         issue_iid = int(payload.get("iid", 0))
         title = str(payload.get("title", "")).strip()
-        if issue_iid <= 0 or not title:
+        if issue_iid <= 0 or not title or item_project_id <= 0:
             return
 
-        if self._active_issue_iid is not None and self._active_issue_iid != issue_iid:
+        if (
+            self._active_issue_iid is not None
+            and (
+                self._active_issue_iid != issue_iid
+                or self._active_issue_project_id != item_project_id
+                or self._active_item_type != item_type
+            )
+        ):
             self._stop_active_work()
 
+        target_project_id, target_iid, target_type = self._resolve_tracking_target(item_type, item_project_id, issue_iid)
         self._active_issue_iid = issue_iid
+        self._active_issue_project_id = item_project_id
+        self._active_item_type = item_type
+        self._active_target_project_id = target_project_id
+        self._active_target_iid = target_iid
+        self._active_target_type = target_type
         self._active_issue_title = title
         self._active_started_at = time.time()
         self._save_board_state()
         self._refresh_tracking_info()
 
     def _stop_work_from_payload(self, payload: dict) -> None:
+        item_type = str(payload.get("item_type", "issue"))
+        item_project_id = int(payload.get("project_id", 0))
         issue_iid = int(payload.get("iid", 0))
         if self._active_issue_iid is None:
             return
-        if issue_iid != self._active_issue_iid:
+        if (
+            issue_iid != self._active_issue_iid
+            or item_project_id != self._active_issue_project_id
+            or item_type != self._active_item_type
+        ):
             return
         self._stop_active_work()
 
@@ -771,21 +1022,37 @@ class TrackerWindow(QMainWindow):
             finished_at = time.time()
             elapsed_seconds = max(1, int(finished_at - self._active_started_at))
             try:
-                active_issue = self._find_issue_by_iid(self._active_issue_iid)
-                if active_issue is None:
-                    raise ValueError(f"Issue #{self._active_issue_iid} not found in loaded list")
-                self._client.add_spent_time(active_issue.project_id, self._active_issue_iid, elapsed_seconds)
+                if (
+                    self._active_target_project_id is None
+                    or self._active_target_iid is None
+                    or not self._active_target_type
+                ):
+                    raise ValueError("Active tracking target is undefined")
+                self._client.add_spent_time(
+                    self._active_target_type,
+                    self._active_target_project_id,
+                    self._active_target_iid,
+                    elapsed_seconds,
+                )
+                cache_key = (self._active_target_type, self._active_target_project_id, self._active_target_iid)
+                self._spent_events_cache.setdefault(cache_key, []).append(
+                    {
+                        "finished_at": datetime.fromtimestamp(finished_at).isoformat(timespec="seconds"),
+                        "duration_seconds": elapsed_seconds,
+                    }
+                )
                 self.statusBar().showMessage(
                     f"Spent time added to issue #{self._active_issue_iid}: {self._format_duration(elapsed_seconds)}",
                     6000,
                 )
             except Exception as error:  # noqa: BLE001
-                if self._is_retryable_error(error):
+                if _is_retryable_network_error(error):
                     self._storage.enqueue_event(
                         "add_spent_time",
                         {
-                            "project_id": active_issue.project_id,
-                            "iid": self._active_issue_iid,
+                            "project_id": self._active_target_project_id,
+                            "iid": self._active_target_iid,
+                            "item_type": self._active_target_type,
                             "spent_seconds": elapsed_seconds,
                         },
                     )
@@ -800,6 +1067,11 @@ class TrackerWindow(QMainWindow):
                         f"Failed to add spent time for issue #{self._active_issue_iid}:\n{error}",
                     )
         self._active_issue_iid = None
+        self._active_issue_project_id = None
+        self._active_item_type = "issue"
+        self._active_target_project_id = None
+        self._active_target_iid = None
+        self._active_target_type = "issue"
         self._active_issue_title = ""
         self._active_started_at = None
         self._save_board_state()
@@ -822,12 +1094,20 @@ class TrackerWindow(QMainWindow):
         self._today_total_label.setText(self._format_duration(self._today_total_seconds + active_elapsed))
 
     def _load_tracking_state(self) -> None:
-        issue_iid, title, started_at = self._storage.load_tracking()
+        issue_iid, title, started_at, project_id, item_type, target_project_id, target_iid, target_type = self._storage.load_tracking()
         self._active_issue_iid = issue_iid
         self._active_issue_title = title
         self._active_started_at = started_at
+        self._active_issue_project_id = project_id
+        self._active_item_type = item_type
+        self._active_target_project_id = target_project_id
+        self._active_target_type = target_type
+        self._active_target_iid = target_iid
 
     def _show_issue_total_time(self, payload: dict) -> None:
+        if str(payload.get("item_type", "issue")) != "issue":
+            QMessageBox.information(self, "Time Summary", "Time summary is available only for issues.")
+            return
         issue_iid = int(payload.get("iid", 0))
         title = str(payload.get("title", "")).strip()
         project_id = int(payload.get("project_id", 0))
@@ -852,13 +1132,16 @@ class TrackerWindow(QMainWindow):
         )
 
     def _show_issue_work_sessions(self, payload: dict) -> None:
+        if str(payload.get("item_type", "issue")) != "issue":
+            QMessageBox.information(self, "Work Sessions", "Work sessions are available only for issues.")
+            return
         issue_iid = int(payload.get("iid", 0))
         project_id = int(payload.get("project_id", 0))
         issue_title = str(payload.get("title", "")).strip()
         if issue_iid <= 0:
             return
         try:
-            spent_events = self._load_spent_events_from_gitlab(project_id, issue_iid)
+            spent_events = self._load_spent_events_from_gitlab("issue", project_id, issue_iid)
         except Exception as error:  # noqa: BLE001
             QMessageBox.warning(self, "GitLab Time Tracking", f"Failed to load work sessions:\n{error}")
             return
@@ -895,13 +1178,13 @@ class TrackerWindow(QMainWindow):
                 return
 
         try:
-            self._client.reset_spent_time(project_id, issue_iid)
+            self._client.reset_spent_time("issue", project_id, issue_iid)
             for started, finished in sorted(updated_ranges):
-                self._client.add_spent_time(project_id, issue_iid, finished - started)
-            cache_key = (project_id, issue_iid)
+                self._client.add_spent_time("issue", project_id, issue_iid, finished - started)
+            cache_key = ("issue", project_id, issue_iid)
             if cache_key in self._spent_events_cache:
                 del self._spent_events_cache[cache_key]
-            self._update_today_total()
+            self._start_today_total_scan()
             self.statusBar().showMessage(f"Work sessions saved for issue #{issue_iid}", 5000)
         except Exception as error:  # noqa: BLE001
             QMessageBox.warning(self, "Work Sessions", f"Failed to save sessions:\n{error}")
@@ -926,25 +1209,28 @@ class TrackerWindow(QMainWindow):
             target_qdate.day(),
         ).date()
 
-        issue_totals: dict[tuple[int, int], int] = {}
-        issue_titles: dict[tuple[int, int], str] = {}
-        issues = list(self._issues_by_iid.values())
-        progress = QProgressDialog("Building daily report...", "Cancel", 0, len(issues), self)
+        issue_totals: dict[tuple[str, int, int], int] = {}
+        report_items = self._report_source_items()
+        progress = QProgressDialog("Building daily report...", "Cancel", 0, len(report_items), self)
         progress.setWindowTitle("Daily Report")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
 
-        for index, issue in enumerate(issues, start=1):
-            progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(issues)})...")
+        for index, issue in enumerate(report_items, start=1):
+            progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(report_items)})...")
             progress.setValue(index - 1)
             QApplication.processEvents()
             if progress.wasCanceled():
                 return
 
             try:
-                cache_key = (issue.project_id, issue.iid)
+                cache_key = (issue.item_type, issue.project_id, issue.iid)
                 if cache_key not in self._spent_events_cache:
-                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(issue.project_id, issue.iid)
+                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(
+                        issue.item_type,
+                        issue.project_id,
+                        issue.iid,
+                    )
                 events = self._spent_events_cache[cache_key]
             except Exception as error:  # noqa: BLE001
                 progress.close()
@@ -955,8 +1241,7 @@ class TrackerWindow(QMainWindow):
                 )
                 return
 
-            key = (issue.project_id, issue.iid)
-            issue_titles[key] = issue.title
+            key = (issue.item_type, issue.project_id, issue.iid)
             issue_totals.setdefault(key, 0)
             for event in events:
                 finished_at = self._parse_iso_datetime(event.get("finished_at"))
@@ -970,15 +1255,15 @@ class TrackerWindow(QMainWindow):
             QApplication.processEvents()
         progress.close()
 
-        report_items = [(key, seconds) for key, seconds in issue_totals.items() if seconds > 0]
-        report_items.sort(key=lambda item: item[1], reverse=True)
-        total_seconds = sum(seconds for _, seconds in report_items)
+        non_zero_items = [(key, seconds) for key, seconds in issue_totals.items() if seconds > 0]
+        non_zero_items.sort(key=lambda item: item[1], reverse=True)
+        total_seconds = sum(seconds for _, seconds in non_zero_items)
 
         lines = [f"{target_date.isoformat()} | Total: {self._format_duration(total_seconds)}", ""]
-        if not report_items:
+        if not non_zero_items:
             lines.append("No tracked time for this date.")
         else:
-            for (project_id, issue_iid), seconds in report_items:
+            for (_item_type, project_id, issue_iid), seconds in non_zero_items:
                 tag = self._PROJECT_TAGS.get(project_id, f"P{project_id}")
                 lines.append(f"{tag} | #{issue_iid} | {self._format_duration(seconds)}")
 
@@ -1026,7 +1311,7 @@ class TrackerWindow(QMainWindow):
             QMessageBox.warning(self, "Period Report", "'From' date must be before or equal to 'To' date.")
             return
 
-        issues = list(self._issues_by_iid.values())
+        issues = self._report_source_items()
         progress = QProgressDialog("Building period report...", "Cancel", 0, len(issues), self)
         progress.setWindowTitle("Period Report")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -1041,9 +1326,13 @@ class TrackerWindow(QMainWindow):
                 return
 
             try:
-                cache_key = (issue.project_id, issue.iid)
+                cache_key = (issue.item_type, issue.project_id, issue.iid)
                 if cache_key not in self._spent_events_cache:
-                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(issue.project_id, issue.iid)
+                    self._spent_events_cache[cache_key] = self._load_spent_events_from_gitlab(
+                        issue.item_type,
+                        issue.project_id,
+                        issue.iid,
+                    )
                 events = self._spent_events_cache[cache_key]
             except Exception as error:  # noqa: BLE001
                 progress.close()
@@ -1099,14 +1388,39 @@ class TrackerWindow(QMainWindow):
     def _load_timelogs_from_gitlab(self, project_id: int, issue_iid: int) -> list[dict]:
         return self._client.get_issue_time_logs(project_id, issue_iid)
 
-    def _load_spent_events_from_gitlab(self, project_id: int, issue_iid: int) -> list[dict]:
-        return self._client.get_issue_spent_time_events(project_id, issue_iid)
+    def _load_spent_events_from_gitlab(
+        self,
+        item_type: str,
+        project_id: int,
+        issue_iid: int,
+        since_date: date | None = None,
+    ) -> list[dict]:
+        return self._client.get_spent_time_events(item_type, project_id, issue_iid, since_date=since_date)
+
+    def _report_source_items(self) -> list[GitLabIssue]:
+        items: dict[tuple[str, int, int], GitLabIssue] = {}
+        for issue in self._issues_by_iid.values():
+            items[(issue.item_type, issue.project_id, issue.iid)] = issue
+        for item in self._review_items:
+            items[(item.item_type, item.project_id, item.iid)] = item
+        return list(items.values())
+
+    def _resolve_tracking_target(self, item_type: str, project_id: int, item_iid: int) -> tuple[int, int, str]:
+        if item_type == "merge_request":
+            try:
+                issue_target = self._client.get_merge_request_closing_issue(project_id, item_iid)
+                if issue_target is not None:
+                    return issue_target[0], issue_target[1], "issue"
+            except Exception:  # noqa: BLE001
+                pass
+            return project_id, item_iid, "merge_request"
+        return project_id, item_iid, "issue"
 
     def _update_today_total(self) -> None:
         today = datetime.now().date()
         total = 0
-        for issue in self._issues_by_iid.values():
-            cache_key = (issue.project_id, issue.iid)
+        for issue in self._report_source_items():
+            cache_key = (issue.item_type, issue.project_id, issue.iid)
             if cache_key not in self._spent_events_cache:
                 continue
             for event in self._spent_events_cache[cache_key]:
@@ -1118,51 +1432,77 @@ class TrackerWindow(QMainWindow):
                     total += duration
         self._today_total_seconds = total
 
+    def _start_today_total_scan(self) -> None:
+        """Start a background scan of today's spent time across all recently-updated items."""
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._scan_restart_requested = True
+            return
+
+        self._today_scan_total_seconds = 0
+        today_day = datetime.now().date().isoformat()
+        self._today_scan_day = today_day
+        self._today_scan_cache = self._storage.load_today_scan_cache(today_day)
+        self._today_total_seconds = sum(int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values())
+        self._refresh_tracking_info()
+        today = datetime.now().date()
+        thread = TodayScanThread(self._client, today, dict(self._today_scan_cache), self)
+        thread.item_scanned.connect(self._on_scan_item)
+        thread.finished.connect(self._on_scan_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._current_scan_worker = thread
+        self._scan_thread = thread
+        thread.start()
+
+    def _on_scan_item(
+        self,
+        item_type: str,
+        project_id: int,
+        iid: int,
+        events: list,
+        item_total: int,
+        from_cache: bool,
+    ) -> None:
+        """Receive one scanned item from TodayScanWorker and update the today total."""
+        if self._current_scan_worker is None or self.sender() is not self._current_scan_worker:
+            return
+        cache_key = (item_type, project_id, iid)
+        item_key = f"{item_type}:{project_id}:{iid}"
+        old_total = int(self._today_scan_cache.get(item_key, {}).get("total", 0) or 0)
+        self._today_scan_cache[item_key] = {"total": float(max(0, item_total)), "ts": time.time()}
+        if not from_cache:
+            self._spent_events_cache[cache_key] = events
+        self._today_total_seconds = max(0, self._today_total_seconds - old_total + max(0, item_total))
+        self._refresh_tracking_info()
+
+    def _on_scan_finished(self) -> None:
+        """Persist scan cache and optionally restart scan if requested while running."""
+        if self._today_scan_day:
+            self._storage.save_today_scan_cache(self._today_scan_day, self._today_scan_cache)
+        self._current_scan_worker = None
+        self._scan_thread = None
+        if self._scan_restart_requested:
+            self._scan_restart_requested = False
+            self._start_today_total_scan()
+
     def _sync_pending_events(self) -> None:
-        queued = self._storage.load_events(limit=100)
+        """Launch SyncWorker to flush the offline queue in a background thread."""
+        if self._refresh_in_progress:
+            return
+        if self._sync_worker_thread is not None and self._sync_worker_thread.isRunning():
+            return
+        queued = self._storage.load_events(limit=20)
         if not queued:
             return
-        for event in queued:
-            event_id = int(event["id"])
-            event_type = str(event["event_type"])
-            payload = event["payload"]
-            try:
-                if event_type == "add_spent_time":
-                    self._client.add_spent_time(
-                        int(payload["project_id"]),
-                        int(payload["iid"]),
-                        int(payload["spent_seconds"]),
-                    )
-                elif event_type == "move_issue":
-                    issue = GitLabIssue(
-                        project_id=int(payload["project_id"]),
-                        iid=int(payload["iid"]),
-                        title=str(payload["title"]),
-                        web_url=str(payload["web_url"]),
-                        labels=[str(item) for item in payload.get("labels", [])],
-                        assignee_ids=[int(value) for value in payload.get("assignee_ids", [])],
-                        reviewer_ids=[int(value) for value in payload.get("reviewer_ids", [])],
-                    )
-                    self._client.move_issue_to_label(
-                        issue=issue,
-                        target_label=str(payload["target_label"]),
-                        current_column=str(payload["current_column"]),
-                    )
-                self._storage.delete_event(event_id)
-            except Exception as error:  # noqa: BLE001
-                if self._is_retryable_error(error):
-                    break
-                self._storage.delete_event(event_id)
-        self._update_today_total()
+        thread = SyncThread(self._client, self._storage, queued, self)
+        thread.scan_needed.connect(self._start_today_total_scan)
+        thread.finished.connect(self._on_sync_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._sync_worker_thread = thread
+        thread.start()
 
-    @staticmethod
-    def _is_retryable_error(error: Exception) -> bool:
-        if isinstance(error, requests.RequestException):
-            if error.response is None:
-                return True
-            status = error.response.status_code
-            return status >= 500
-        return False
+    def _on_sync_finished(self) -> None:
+        """Clear sync thread reference after completion."""
+        self._sync_worker_thread = None
 
     @staticmethod
     def _apply_local_move(issue: GitLabIssue, target_label: str, current_column: str) -> GitLabIssue:
@@ -1180,6 +1520,7 @@ class TrackerWindow(QMainWindow):
             labels=labels,
             assignee_ids=issue.assignee_ids,
             reviewer_ids=issue.reviewer_ids,
+            item_type=issue.item_type,
         )
 
     def _find_issue_by_iid(self, iid: int) -> GitLabIssue | None:
@@ -1193,6 +1534,12 @@ class TrackerWindow(QMainWindow):
         if current_user_id is None:
             return False
         return (current_user_id in issue.reviewer_ids) and (current_user_id not in issue.assignee_ids)
+
+    def _is_assignee_issue(self, issue: GitLabIssue) -> bool:
+        current_user_id = self._client.user_id
+        if current_user_id is None:
+            return True
+        return current_user_id in issue.assignee_ids
 
     @staticmethod
     def _parse_iso_datetime(value: object) -> float | None:
