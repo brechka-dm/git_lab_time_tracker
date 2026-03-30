@@ -202,6 +202,28 @@ class AppStorage:
         """Persist per-item totals cache for a date."""
         self._set_value(f"today_scan_cache:{day}", json.dumps(cache, ensure_ascii=True))
 
+    def save_issues_cache(self, issues: list[dict], review_mrs: list[dict]) -> None:
+        """Persist fetched issues and review MRs for instant startup."""
+        payload = {"issues": issues, "review_mrs": review_mrs, "ts": time.time()}
+        self._set_value("issues_cache", json.dumps(payload, ensure_ascii=True))
+
+    def load_issues_cache(self) -> tuple[list[dict], list[dict]] | None:
+        """Return cached (issues, review_mrs) dicts, or None if no cache exists."""
+        raw = self._get_value("issues_cache")
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(payload, dict):
+            return None
+        issues = payload.get("issues")
+        review_mrs = payload.get("review_mrs")
+        if not isinstance(issues, list) or not isinstance(review_mrs, list):
+            return None
+        return issues, review_mrs
+
     def enqueue_event(self, event_type: str, payload: dict) -> None:
         with self._connect() as connection:
             connection.execute(

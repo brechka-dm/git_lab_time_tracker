@@ -43,6 +43,28 @@ from models import GitLabIssue
 from storage import AppStorage
 
 
+def _issue_to_dict(issue: GitLabIssue) -> dict:
+    """Serialize GitLabIssue to a plain dict for SQLite caching."""
+    return asdict(issue)
+
+
+def _issue_from_dict(data: dict) -> GitLabIssue | None:
+    """Deserialize a GitLabIssue from a plain dict; return None if data is invalid."""
+    try:
+        return GitLabIssue(
+            project_id=int(data["project_id"]),
+            iid=int(data["iid"]),
+            title=str(data["title"]),
+            web_url=str(data["web_url"]),
+            labels=[str(lbl) for lbl in data.get("labels", [])],
+            assignee_ids=[int(v) for v in data.get("assignee_ids", [])],
+            reviewer_ids=[int(v) for v in data.get("reviewer_ids", [])],
+            item_type=str(data.get("item_type", "issue")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 class BoardListWidget(QListWidget):
     """List that accepts dropped issue cards from other columns."""
 
@@ -585,6 +607,12 @@ class TrackerWindow(QMainWindow):
         if self._refresh_in_progress:
             return
 
+        cached = self._storage.load_issues_cache()
+        if cached is not None:
+            cached_issues = [i for d in cached[0] if (i := _issue_from_dict(d)) is not None]
+            cached_mrs = [i for d in cached[1] if (i := _issue_from_dict(d)) is not None]
+            self._apply_cached(cached_issues, cached_mrs)
+
         self._refresh_in_progress = True
         self._refresh_btn.setEnabled(False)
         self.statusBar().showMessage("Refreshing from GitLab…")
@@ -597,15 +625,30 @@ class TrackerWindow(QMainWindow):
         self._refresh_thread = thread
         thread.start()
 
+    def _apply_cached(self, issues: list[GitLabIssue], review_mrs: list[GitLabIssue]) -> None:
+        """Show cached issues immediately on startup before the network refresh completes."""
+        self._last_issues = issues
+        self._review_items = review_mrs
+        self._issues_by_iid = {(issue.project_id, issue.iid): issue for issue in issues}
+        self._sync_boards_from_issues(issues)
+        grouped = self._group_issues(issues)
+        self._rebuild_columns(grouped)
+        self._start_today_total_scan()
+        self.statusBar().showMessage(f"Showing {len(issues)} cached issues — refreshing…")
+
     def _apply_refresh(
         self,
         issues: list[GitLabIssue],
         review_mrs: list[GitLabIssue],
     ) -> None:
-        """Apply loaded issues to the UI (called in the UI thread via queued connection)."""
+        """Apply freshly loaded issues to the UI (called in the UI thread via queued connection)."""
         self._refresh_in_progress = False
         self._refresh_btn.setEnabled(True)
         self.statusBar().clearMessage()
+        self._storage.save_issues_cache(
+            [_issue_to_dict(i) for i in issues],
+            [_issue_to_dict(i) for i in review_mrs],
+        )
         self._last_issues = issues
         self._review_items = review_mrs
         self._issues_by_iid = {(issue.project_id, issue.iid): issue for issue in issues}
