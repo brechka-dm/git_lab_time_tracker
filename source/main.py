@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from board import TrackerWindow
 from config import load_config
+from crash_report import install_crash_hooks
 from gitlab_client import GitLabClient
 from storage import AppStorage
 
@@ -34,8 +35,9 @@ def _find_config(exe_dir: Path) -> Path:
 
 def main() -> int:
     """Start desktop app."""
-    app = QApplication(sys.argv)
     exe_dir = _exe_dir()
+    install_crash_hooks(exe_dir)
+    app = QApplication(sys.argv)
     config_path = _find_config(exe_dir)
 
     try:

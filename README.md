@@ -33,6 +33,7 @@ Desktop Python app with a Kanban board for GitLab issues, time tracking, and rep
 ### Data on disk
 
 - UI state, tracking, local tasks, the offline event queue, and the “today” cache live in SQLite **`tracker.db`** (next to the exe, or project root when running from source).
+- Uncaught **Python** exceptions (main thread and worker threads) are **appended** to **`crash_report.txt`** in the same directory. Normal exits, `SystemExit`, and `KeyboardInterrupt` are not logged. Native crashes (e.g. access violations) are not captured here.
 
 ## Dependencies
 
@@ -114,6 +115,7 @@ If you add modules under `source/board/`, register them in `hiddenimports` in `t
 
 - `main.py` — root entrypoint.
 - `source/main.py` — Qt bootstrap and config load.
+- `source/crash_report.py` — append-only crash log (`crash_report.txt`) via `sys` / `threading` exception hooks.
 - `source/board/` — main window, board widgets, reports, refresh/sync threads.
 - `source/gitlab_client.py` — GitLab API calls.
 - `source/storage.py` — SQLite persistence.

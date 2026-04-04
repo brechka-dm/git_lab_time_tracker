@@ -11,6 +11,7 @@ a = Analysis(
         ('gitlab_access.ini', '.'),
     ],
     hiddenimports=[
+        'crash_report',
         'board',
         'board.board_column',
         'board.board_labels',
