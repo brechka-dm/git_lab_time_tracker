@@ -34,11 +34,13 @@ from .report_builder import (
 LoadEventsFn = Callable[[str, int, int], list[dict]]
 LocalDayTotalsFn = Callable[[date], list[tuple[int, str, int]]]
 LocalPeriodTotalsFn = Callable[[date, date], list[tuple[int, str, int]]]
+ReportItemsForDayFn = Callable[[date], list[GitLabIssue]]
+ReportItemsForPeriodFn = Callable[[date, date], list[GitLabIssue]]
 
 
 def run_daily_report(
     parent: QWidget,
-    report_items: list[GitLabIssue],
+    get_report_items: ReportItemsForDayFn,
     spent_events_cache: dict[tuple[str, int, int], list[dict]],
     load_events: LoadEventsFn,
     load_local_totals_for_day: LocalDayTotalsFn,
@@ -59,6 +61,7 @@ def run_daily_report(
     target_qdate = calendar.selectedDate()
     target_date = datetime(target_qdate.year(), target_qdate.month(), target_qdate.day()).date()
 
+    report_items = get_report_items(target_date)
     progress = QProgressDialog("Building daily report...", "Cancel", 0, len(report_items), parent)
     progress.setWindowTitle("Daily Report")
     progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -112,7 +115,7 @@ def run_daily_report(
 
 def run_period_report(
     parent: QWidget,
-    report_items: list[GitLabIssue],
+    get_report_items: ReportItemsForPeriodFn,
     spent_events_cache: dict[tuple[str, int, int], list[dict]],
     load_events: LoadEventsFn,
     load_local_totals_for_period: LocalPeriodTotalsFn,
@@ -153,6 +156,7 @@ def run_period_report(
         QMessageBox.warning(parent, "Period Report", "'From' date must be before or equal to 'To' date.")
         return
 
+    report_items = get_report_items(start_date, end_date)
     progress = QProgressDialog("Building period report...", "Cancel", 0, len(report_items), parent)
     progress.setWindowTitle("Period Report")
     progress.setWindowModality(Qt.WindowModality.WindowModal)

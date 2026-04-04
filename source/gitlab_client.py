@@ -148,6 +148,58 @@ class GitLabClient:
         response = self._session.post(url, timeout=(5, 10))
         response.raise_for_status()
 
+    def delete_issue_note(self, item_type: str, project_id: int, item_iid: int, note_id: int) -> None:
+        """Delete a single issue or merge request note (used to remove one spent-time system note)."""
+        resource = "issues" if item_type == "issue" else "merge_requests"
+        url = f"{self._base_url}/projects/{project_id}/{resource}/{item_iid}/notes/{note_id}"
+        response = self._session.delete(url, timeout=(5, 10))
+        response.raise_for_status()
+
+    def apply_issue_work_session_edits(
+        self,
+        project_id: int,
+        issue_iid: int,
+        original_rows: list[dict[str, int]],
+        new_ranges: list[tuple[int, int]],
+    ) -> None:
+        """Push work-session edits without resetting the whole issue when possible.
+
+        Increases only call add_spent_time with the delta. Decreases delete the matching
+        system note (note_id) then re-add the new duration. If a decrease targets an
+        entry without note_id, falls back to reset_spent_time plus re-adding all sessions.
+        """
+        if len(original_rows) != len(new_ranges):
+            raise ValueError("Work session row count mismatch")
+        ops: list[tuple[str, ...]] = []
+        use_full_reset = False
+        for orig, (ns, nf) in zip(original_rows, new_ranges, strict=True):
+            olds = int(orig["started_at"])
+            olde = int(orig["finished_at"])
+            old_dur = olde - olds
+            new_dur = nf - ns
+            note_id = int(orig.get("note_id", 0))
+            if new_dur == old_dur:
+                continue
+            if new_dur > old_dur:
+                ops.append(("add_delta", new_dur - old_dur))
+                continue
+            if note_id <= 0:
+                use_full_reset = True
+                break
+            ops.append(("replace", note_id, new_dur))
+        if use_full_reset:
+            self.reset_spent_time("issue", project_id, issue_iid)
+            for started, finished in sorted(new_ranges, key=lambda item: item[0]):
+                self.add_spent_time("issue", project_id, issue_iid, finished - started)
+            return
+        for op in ops:
+            if op[0] == "add_delta":
+                self.add_spent_time("issue", project_id, issue_iid, int(op[1]))
+            elif op[0] == "replace":
+                _, note_id, new_dur = op
+                self.delete_issue_note("issue", project_id, issue_iid, int(note_id))
+                self.add_spent_time("issue", project_id, issue_iid, int(new_dur))
+
     def get_issue_time_summary(self, project_id: int, issue_iid: int) -> dict[str, Any]:
         """Get total spent and estimate info for issue."""
         url = f"{self._base_url}/projects/{project_id}/issues/{issue_iid}"
@@ -201,7 +253,14 @@ class GitLabClient:
                     continue
                 if created_dt.date() < since_date:
                     continue
-            events.append({"finished_at": created_at, "duration_seconds": duration_seconds})
+            note_id = int(note.get("id", 0) or 0)
+            events.append(
+                {
+                    "finished_at": created_at,
+                    "duration_seconds": duration_seconds,
+                    "note_id": note_id,
+                }
+            )
         return events
 
     def get_merge_request_closing_issue(self, project_id: int, mr_iid: int) -> tuple[int, int] | None:
@@ -229,6 +288,7 @@ class GitLabClient:
         while True:
             params = {
                 "scope": "all",
+                "state": "all",
                 "updated_after": since_iso,
                 "per_page": 100,
                 "page": page,

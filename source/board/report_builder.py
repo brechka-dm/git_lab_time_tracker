@@ -78,15 +78,15 @@ def render_daily_report_text(
     """Render daily report text using collected totals."""
     local_total = sum(seconds for _, _, seconds in local_items)
     total_seconds = sum(seconds for _, seconds in issue_totals) + local_total
-    lines = [f"{target_date.isoformat()} | Total: {format_duration(total_seconds)}", ""]
+    lines = [f"{target_date.isoformat()}\t{format_duration(total_seconds)}", ""]
     if not issue_totals and not local_items:
         lines.append("No tracked time for this date.")
     else:
         for (_item_type, project_id, issue_iid), seconds in issue_totals:
             tag = project_tags.get(project_id, f"P{project_id}")
-            lines.append(f"{tag} | #{issue_iid} | {format_duration(seconds)}")
+            lines.append(f"{tag}{issue_iid}\t{format_duration(seconds)}")
     for _task_id, title, seconds in local_items:
-        lines.append(f"LOCAL | {title} | {format_duration(seconds)}")
+        lines.append(f"LOCAL\t{title}\t{format_duration(seconds)}")
     if gitlab_failures:
         lines.extend(["", "GitLab rows omitted due to errors:"])
         max_notes = 15

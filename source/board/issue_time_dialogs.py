@@ -108,12 +108,21 @@ def show_issue_work_sessions(
         return
 
     sessions: list[dict[str, float]] = []
+    original_rows: list[dict[str, int]] = []
     for event in spent_events:
         finished_at = parse_iso_datetime(event.get("finished_at"))
         duration = int(event.get("duration_seconds", 0) or 0)
         if finished_at is None or duration <= 0:
             continue
         started_at = finished_at - duration
+        note_id = int(event.get("note_id", 0) or 0)
+        original_rows.append(
+            {
+                "note_id": note_id,
+                "started_at": int(started_at),
+                "finished_at": int(finished_at),
+            }
+        )
         sessions.append(
             {
                 "started_at": float(started_at),
@@ -122,6 +131,7 @@ def show_issue_work_sessions(
             }
         )
     sessions.sort(key=lambda item: item["started_at"])
+    original_rows.sort(key=lambda row: row["started_at"])
 
     dialog = WorkSessionsDialog(f"#{issue_iid} {issue_title}", sessions, parent)
     if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -136,9 +146,7 @@ def show_issue_work_sessions(
             return
 
     try:
-        client.reset_spent_time("issue", project_id, issue_iid)
-        for started, finished in sorted(updated_ranges):
-            client.add_spent_time("issue", project_id, issue_iid, finished - started)
+        client.apply_issue_work_session_edits(project_id, issue_iid, original_rows, updated_ranges)
         cache_key = ("issue", project_id, issue_iid)
         if cache_key in spent_events_cache:
             del spent_events_cache[cache_key]

@@ -40,7 +40,7 @@ from .local_time_totals import local_totals_for_day, local_totals_for_period
 from .network import is_retryable_network_error
 from .refresh_thread import RefreshThread
 from .report_dialogs import run_daily_report, run_period_report
-from .report_source import report_source_items
+from .report_source import merge_report_item_lists, report_source_items
 from .sync_thread import SyncThread
 from .time_formatting import format_duration
 from .today_scan_thread import TodayScanThread
@@ -780,6 +780,7 @@ class TrackerWindow(QMainWindow):
         self._stop_active_work()
 
     def _stop_active_work(self) -> None:
+        bump_gitlab_today: tuple[str, int, int, int] | None = None
         if self._active_started_at is not None and (
             self._active_is_local or self._active_issue_iid is not None
         ):
@@ -823,6 +824,12 @@ class TrackerWindow(QMainWindow):
                     self._active_target_iid,
                     elapsed_seconds,
                 )
+                bump_gitlab_today = (
+                    self._active_target_type,
+                    self._active_target_project_id,
+                    self._active_target_iid,
+                    elapsed_seconds,
+                )
                 cache_key = (self._active_target_type, self._active_target_project_id, self._active_target_iid)
                 self._spent_events_cache.setdefault(cache_key, []).append(
                     {
@@ -845,6 +852,12 @@ class TrackerWindow(QMainWindow):
                             "spent_seconds": elapsed_seconds,
                         },
                     )
+                    bump_gitlab_today = (
+                        self._active_target_type,
+                        self._active_target_project_id,
+                        self._active_target_iid,
+                        elapsed_seconds,
+                    )
                     self.statusBar().showMessage(
                         f"Connection lost. Time event queued for issue #{self._active_issue_iid}.",
                         7000,
@@ -866,6 +879,8 @@ class TrackerWindow(QMainWindow):
         self._active_issue_title = ""
         self._active_started_at = None
         self._save_board_state()
+        if bump_gitlab_today is not None:
+            self._apply_gitlab_elapsed_to_today_total(*bump_gitlab_today)
         self._refresh_tracking_info()
 
     def _refresh_tracking_info(self) -> None:
@@ -936,10 +951,19 @@ class TrackerWindow(QMainWindow):
             self.statusBar().showMessage,
         )
 
+    def _report_items_with_gitlab_updates(self, since_date: date) -> list[GitLabIssue]:
+        """Board items plus issues/MRs updated on or after since_date (incl. closed)."""
+        base = report_source_items(self._issues_by_iid, self._review_items)
+        try:
+            extra = self._client.fetch_items_updated_since(since_date)
+        except Exception:  # noqa: BLE001
+            return base
+        return merge_report_item_lists(base, extra)
+
     def _show_daily_report(self) -> None:
         run_daily_report(
             self,
-            report_source_items(self._issues_by_iid, self._review_items),
+            self._report_items_with_gitlab_updates,
             self._spent_events_cache,
             lambda item_type, project_id, issue_iid: self._load_spent_events_from_gitlab(item_type, project_id, issue_iid),
             lambda target_date: local_totals_for_day(self._storage, self._local_tasks_by_id, target_date),
@@ -948,7 +972,7 @@ class TrackerWindow(QMainWindow):
     def _show_period_report(self) -> None:
         run_period_report(
             self,
-            report_source_items(self._issues_by_iid, self._review_items),
+            lambda start_date, end_date: self._report_items_with_gitlab_updates(start_date),
             self._spent_events_cache,
             lambda item_type, project_id, issue_iid: self._load_spent_events_from_gitlab(item_type, project_id, issue_iid),
             lambda start_date, end_date: local_totals_for_period(self._storage, self._local_tasks_by_id, start_date, end_date),
@@ -976,6 +1000,39 @@ class TrackerWindow(QMainWindow):
                 pass
             return project_id, item_iid, "merge_request"
         return project_id, item_iid, "issue"
+
+    def _apply_gitlab_elapsed_to_today_total(
+        self,
+        target_type: str,
+        target_project_id: int,
+        target_iid: int,
+        elapsed_seconds: int,
+    ) -> None:
+        """Add completed GitLab session seconds to today total and scan cache (same as local stop)."""
+        today = datetime.now().date()
+        day_iso = today.isoformat()
+        if self._today_scan_day != day_iso:
+            self._today_scan_day = day_iso
+            self._today_scan_cache = self._storage.load_today_scan_cache(day_iso)
+        item_key = f"{target_type}:{target_project_id}:{target_iid}"
+        prev = int(self._today_scan_cache.get(item_key, {}).get("total", 0) or 0)
+        add_seconds = max(1, int(elapsed_seconds))
+        self._today_scan_cache[item_key] = {
+            "total": float(max(0, prev + add_seconds)),
+            "ts": time.time(),
+        }
+        self._storage.save_today_scan_cache(day_iso, self._today_scan_cache)
+        self._today_total_seconds = sum(
+            int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values()
+        )
+        self._today_total_seconds += sum(
+            seconds
+            for _, _, seconds in local_totals_for_day(
+                self._storage,
+                self._local_tasks_by_id,
+                today,
+            )
+        )
 
     def _start_today_total_scan(self) -> None:
         """Start a background scan of today's spent time across all recently-updated items."""
