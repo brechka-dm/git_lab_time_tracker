@@ -70,11 +70,31 @@ On Linux/macOS: `source .venv/bin/activate`.
 
 **Python 3.10+** is required (modern type annotation syntax).
 
-## Configuring `gitlab_access.ini`
+## Configuring GitLab (`gitlab_access.ini` + `gitlab_access.ini.user`)
 
-The file lives in the repository root; the PyInstaller build bundles it next to `Tracker.exe` (or falls back to `_internal`).
+Settings are loaded in two layers:
 
-`[gitlab]` section:
+1. **`gitlab_access.ini`** — committed **template** without secrets (example URL and placeholders). Shipped with the repo and bundled into the PyInstaller build (next to `Tracker.exe` or under `_internal` when no local copy exists).
+2. **`gitlab_access.ini.user`** — **private** overrides (token, your `USER_ID`, optional URL/project list). Same directory as the app / repo root. Listed in **`.gitignore`** — never commit it. Values here **override** the same keys in the base file.
+
+At startup both files are merged (user wins). You need a **non-empty `TOKEN`** and valid **`GITLAB_URL`** / **`PROJECT_IDS`** after merge. If something is missing, the app shows a dialog explaining what to fix and where.
+
+### Quick setup
+
+1. Keep or adjust team defaults in **`gitlab_access.ini`** (URL, `PROJECT_IDS` if shared).
+2. Create **`gitlab_access.ini.user`** next to it, for example:
+
+   ```ini
+   [gitlab]
+   TOKEN = glpat-your-token-here
+   USER_ID = 123
+   ```
+
+   You can override `GITLAB_URL` or `PROJECT_IDS` here as well if they differ per developer.
+
+3. For a **built exe**, place **`gitlab_access.ini.user`** in the same folder as **`Tracker.exe`** (same rule as `tracker.db`).
+
+### `[gitlab]` keys
 
 | Key           | Required | Description |
 |---------------|----------|-------------|
@@ -82,6 +102,8 @@ The file lives in the repository root; the PyInstaller build bundles it next to 
 | `TOKEN`       | yes      | Personal access token with API access to the projects |
 | `PROJECT_IDS` | yes      | Comma-separated numeric project IDs, e.g. `2,14,49` |
 | `USER_ID`     | no       | GitLab user id: filters assignee/reviewer when loading issues and when parsing spent-time system notes |
+
+**Security:** If a real token was ever committed to git, **revoke it** in GitLab and create a new one; use only `gitlab_access.ini.user` locally from now on.
 
 ## Run from source
 
@@ -96,7 +118,7 @@ This adds `source/` to the import path and runs `source/main.py`.
 ## Building the exe (Windows, PyInstaller)
 
 1. Install runtime dependencies and PyInstaller (see above).
-2. Fill in `gitlab_access.ini`, or edit the copy under `dist/Tracker/` after the build.
+2. After the build, add **`gitlab_access.ini.user`** next to `dist/Tracker/Tracker.exe` with your `TOKEN` (and optional overrides). The template **`gitlab_access.ini`** is bundled from the repo; you can also place an edited `gitlab_access.ini` beside the exe to replace the bundled defaults.
 3. From the **repository root** run (use this form so Windows finds PyInstaller even when `pyinstaller.exe` is not on `PATH`):
 
 ```bash

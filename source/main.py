@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from board import TrackerWindow
-from config import load_config
+from config import load_config, resolve_gitlab_config_paths
 from crash_report import install_crash_hooks
 from gitlab_client import GitLabClient
 from storage import AppStorage
@@ -21,27 +21,21 @@ def _exe_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _find_config(exe_dir: Path) -> Path:
-    """Locate gitlab_access.ini: prefer a copy next to the exe, fall back to _internal."""
-    candidate = exe_dir / "gitlab_access.ini"
-    if candidate.exists():
-        return candidate
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        bundled = Path(sys._MEIPASS) / "gitlab_access.ini"  # noqa: SLF001
-        if bundled.exists():
-            return bundled
-    return candidate
-
-
 def main() -> int:
     """Start desktop app."""
     exe_dir = _exe_dir()
     install_crash_hooks(exe_dir)
     app = QApplication(sys.argv)
-    config_path = _find_config(exe_dir)
+    base_ini, user_ini = resolve_gitlab_config_paths(exe_dir)
 
     try:
-        config = load_config(config_path)
+        config = load_config(base_ini, user_ini)
+    except FileNotFoundError as error:
+        QMessageBox.critical(None, "GitLab config missing", str(error))
+        return 1
+    except ValueError as error:
+        QMessageBox.critical(None, "GitLab config incomplete", str(error))
+        return 1
     except Exception as error:  # noqa: BLE001
         QMessageBox.critical(None, "Config error", f"Cannot read config:\n{error}")
         return 1
