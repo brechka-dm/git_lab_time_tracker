@@ -8,7 +8,7 @@ from datetime import date, datetime
 import time
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -73,6 +73,7 @@ class TrackerWindow(QMainWindow):
         self._today_scan_cache: dict[str, dict[str, float]] = {}
         self._today_scan_day = ""
         self._issue_orders: dict[str, list[str]] = self._storage.load_issue_orders()
+        self._highlighted_cards: set[str] = self._storage.load_highlighted_cards()
         self._today_total_seconds = 0
         self._active_issue_iid: int | None = None
         self._active_is_local = False
@@ -291,6 +292,7 @@ class TrackerWindow(QMainWindow):
             column.list_widget.stop_work_requested.connect(self._stop_work_from_payload)
             column.list_widget.show_total_time_requested.connect(self._show_issue_total_time)
             column.list_widget.show_work_sessions_requested.connect(self._show_issue_work_sessions)
+            column.list_widget.toggle_highlight_requested.connect(self._toggle_card_highlight)
             column.list_widget.add_local_task_requested.connect(self._on_add_local_task_in_column)
             self._columns[label] = column
             self._board_layout.addWidget(column)
@@ -307,11 +309,15 @@ class TrackerWindow(QMainWindow):
                     issue_payload = asdict(issue)
                     issue_payload["is_local"] = False
                     card.setData(Qt.ItemDataRole.UserRole, issue_payload)
+                    self._apply_card_highlight(card, issue_payload)
                     column.list_widget.addItem(card)
                 else:
                     task = entry
                     local_card = QListWidgetItem(f"LOCAL {task.title}")
                     local_card.setData(Qt.ItemDataRole.UserRole, local_task_to_payload(task))
+                    local_payload = local_card.data(Qt.ItemDataRole.UserRole)
+                    if isinstance(local_payload, dict):
+                        self._apply_card_highlight(local_card, local_payload)
                     column.list_widget.addItem(local_card)
 
     def _on_issue_moved(self, payload: dict, target_label: str) -> None:
@@ -1172,6 +1178,36 @@ class TrackerWindow(QMainWindow):
         if project_id is None or iid is None:
             return None
         return self._issues_by_iid.get((project_id, iid))
+
+    def _toggle_card_highlight(self, payload: dict) -> None:
+        key = self._payload_card_key(payload)
+        if not key:
+            return
+        if key in self._highlighted_cards:
+            self._highlighted_cards.remove(key)
+            self.statusBar().showMessage("Highlight removed", 3000)
+        else:
+            self._highlighted_cards.add(key)
+            self.statusBar().showMessage("Task highlighted", 3000)
+        self._storage.save_highlighted_cards(self._highlighted_cards)
+        self._rebuild_columns(self._group_issues(self._last_issues))
+
+    def _apply_card_highlight(self, item: QListWidgetItem, payload: dict) -> None:
+        key = self._payload_card_key(payload)
+        if key and key in self._highlighted_cards:
+            item.setBackground(QColor("#2f5fa7"))
+            item.setForeground(QColor("#ffffff"))
+        else:
+            item.setBackground(QColor(Qt.GlobalColor.transparent))
+            item.setForeground(self.palette().color(QPalette.ColorRole.Text))
+
+    def _payload_card_key(self, payload: dict) -> str:
+        if bool(payload.get("is_local", False)):
+            task_id = int(payload.get("task_id", 0))
+            return f"local:{task_id}" if task_id > 0 else ""
+        project_id = int(payload.get("project_id", 0))
+        iid = int(payload.get("iid", 0))
+        return f"{project_id}:{iid}" if project_id > 0 and iid > 0 else ""
 
     def _is_review_issue(self, issue: GitLabIssue) -> bool:
         current_user_id = self._client.user_id

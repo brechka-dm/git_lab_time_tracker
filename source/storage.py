@@ -249,6 +249,24 @@ class AppStorage:
     def save_issue_orders(self, orders: dict[str, list[str]]) -> None:
         self._set_value("issue_orders", json.dumps(orders, ensure_ascii=True))
 
+    def load_highlighted_cards(self) -> set[str]:
+        """Load highlighted card keys."""
+        raw = self._get_value("highlighted_cards")
+        if not raw:
+            return set()
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return set()
+        if not isinstance(payload, list):
+            return set()
+        return {str(value) for value in payload if isinstance(value, str) and value.strip()}
+
+    def save_highlighted_cards(self, keys: set[str]) -> None:
+        """Persist highlighted card keys."""
+        payload = sorted(key for key in keys if isinstance(key, str) and key.strip())
+        self._set_value("highlighted_cards", json.dumps(payload, ensure_ascii=True))
+
     def load_today_scan_cache(self, day: str) -> dict[str, dict[str, float]]:
         """Load cached per-item totals for a date."""
         raw = self._get_value(f"today_scan_cache:{day}")

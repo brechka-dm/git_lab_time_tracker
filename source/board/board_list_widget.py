@@ -15,6 +15,7 @@ class BoardListWidget(QListWidget):
     stop_work_requested = Signal(dict)
     show_total_time_requested = Signal(dict)
     show_work_sessions_requested = Signal(dict)
+    toggle_highlight_requested = Signal(dict)
     issue_order_changed = Signal(str, list)
     add_local_task_requested = Signal(str)
 
@@ -47,6 +48,10 @@ class BoardListWidget(QListWidget):
         sessions_action = QAction("Show work sessions", self)
         sessions_action.triggered.connect(self._show_selected_issue_sessions)
         self.addAction(sessions_action)
+
+        highlight_action = QAction("Toggle highlight", self)
+        highlight_action.triggered.connect(self._toggle_selected_issue_highlight)
+        self.addAction(highlight_action)
 
         add_local_action = QAction("Add local task here", self)
         add_local_action.triggered.connect(self._request_add_local_task)
@@ -139,6 +144,14 @@ class BoardListWidget(QListWidget):
 
     def _request_add_local_task(self) -> None:
         self.add_local_task_requested.emit(self._column_label)
+
+    def _toggle_selected_issue_highlight(self) -> None:
+        selected = self.currentItem()
+        if selected is None:
+            return
+        payload = selected.data(Qt.ItemDataRole.UserRole)
+        if isinstance(payload, dict):
+            self.toggle_highlight_requested.emit(payload)
 
     @property
     def column_label(self) -> str:
