@@ -43,7 +43,7 @@ from .report_dialogs import run_daily_report, run_period_report
 from .report_source import merge_report_item_lists, report_source_items
 from .sync_thread import SyncThread
 from .time_formatting import format_duration
-from .today_scan_thread import TodayScanThread
+from .today_scan_thread import TodayScanThread, spent_events_total_for_calendar_day
 
 
 class TrackerWindow(QMainWindow):
@@ -69,6 +69,7 @@ class TrackerWindow(QMainWindow):
         self._scan_thread: QThread | None = None
         self._current_scan_worker: TodayScanThread | None = None
         self._scan_restart_requested = False
+        self._scan_force_refetch_next = False
         self._today_scan_cache: dict[str, dict[str, float]] = {}
         self._today_scan_day = ""
         self._issue_orders: dict[str, list[str]] = self._storage.load_issue_orders()
@@ -128,12 +129,12 @@ class TrackerWindow(QMainWindow):
         self._board_selector.currentTextChanged.connect(self._on_board_changed)
         actions_row.addWidget(self._board_selector)
 
-        add_column_button = QPushButton("Add Column")
-        add_column_button.clicked.connect(self._on_add_column)
-        actions_row.addWidget(add_column_button)
-        add_local_task_button = QPushButton("Add Local Task")
-        add_local_task_button.clicked.connect(self._on_add_local_task_button)
-        actions_row.addWidget(add_local_task_button)
+        self._add_column_button = QPushButton("Add Column")
+        self._add_column_button.clicked.connect(self._on_add_column)
+        actions_row.addWidget(self._add_column_button)
+        self._add_local_task_button = QPushButton("Add Local Task")
+        self._add_local_task_button.clicked.connect(self._on_add_local_task_button)
+        actions_row.addWidget(self._add_local_task_button)
         actions_row.addStretch()
         root_layout.addLayout(actions_row)
 
@@ -143,6 +144,7 @@ class TrackerWindow(QMainWindow):
         self._board_layout = QHBoxLayout(board_container)
         self._board_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         scroll.setWidget(board_container)
+        self._board_scroll = scroll
 
         root_layout.addWidget(scroll)
         self.setCentralWidget(root)
@@ -176,6 +178,7 @@ class TrackerWindow(QMainWindow):
 
         self._refresh_in_progress = True
         self._refresh_btn.setEnabled(False)
+        self._update_interaction_lock()
         self.statusBar().showMessage("Refreshing from GitLab…")
 
         thread = RefreshThread(self._client, self)
@@ -205,6 +208,7 @@ class TrackerWindow(QMainWindow):
         """Apply freshly loaded issues to the UI (called in the UI thread via queued connection)."""
         self._refresh_in_progress = False
         self._refresh_btn.setEnabled(True)
+        self._update_interaction_lock()
         self.statusBar().clearMessage()
         self._storage.save_issues_cache(
             [issue_to_dict(i) for i in issues],
@@ -220,13 +224,14 @@ class TrackerWindow(QMainWindow):
         # Avoid zeroing today total before scan: if the cached-data scan is still
         # running, _start_today_total_scan() returns early and _on_scan_item needs
         # a correct baseline (it does old_total -> new_total deltas).
-        self._start_today_total_scan()
+        self._start_today_total_scan(force_refetch=True)
         self.statusBar().showMessage(f"Loaded {len(issues)} issues", 5000)
 
     def _on_refresh_error(self, error: str) -> None:
         """Handle a refresh failure (called in the UI thread via queued connection)."""
         self._refresh_in_progress = False
         self._refresh_btn.setEnabled(True)
+        self._update_interaction_lock()
         self.statusBar().clearMessage()
         QMessageBox.critical(self, "GitLab error", f"Failed to load issues:\n{error}")
 
@@ -235,6 +240,7 @@ class TrackerWindow(QMainWindow):
         self._refresh_thread = None
         self._refresh_in_progress = False
         self._refresh_btn.setEnabled(True)
+        self._update_interaction_lock()
 
     def _group_issues(self, issues: list[GitLabIssue]) -> dict[str, list[GitLabIssue]]:
         grouped: dict[str, list[GitLabIssue]] = defaultdict(list)
@@ -946,10 +952,38 @@ class TrackerWindow(QMainWindow):
             payload,
             self._client,
             self._storage,
-            self._spent_events_cache,
-            self._start_today_total_scan,
+            self._sync_gitlab_issue_today_total_after_sessions_edit,
             self.statusBar().showMessage,
         )
+
+    def _sync_gitlab_issue_today_total_after_sessions_edit(self, project_id: int, issue_iid: int) -> None:
+        """Reload today's spent time for one issue so totals match GitLab (scan cache can be stale <5 min)."""
+        today = datetime.now().date()
+        day_iso = today.isoformat()
+        self._today_scan_day = day_iso
+        self._today_scan_cache = self._storage.load_today_scan_cache(day_iso)
+        try:
+            events = self._client.get_spent_time_events("issue", project_id, issue_iid, since_date=today)
+        except Exception:  # noqa: BLE001
+            self._start_today_total_scan(force_refetch=True)
+            return
+        item_total = spent_events_total_for_calendar_day(events, today)
+        item_key = f"issue:{project_id}:{issue_iid}"
+        self._today_scan_cache[item_key] = {"total": float(max(0, item_total)), "ts": time.time()}
+        self._storage.save_today_scan_cache(day_iso, self._today_scan_cache)
+        self._spent_events_cache[("issue", project_id, issue_iid)] = events
+        self._today_total_seconds = sum(
+            int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values()
+        )
+        self._today_total_seconds += sum(
+            seconds
+            for _, _, seconds in local_totals_for_day(
+                self._storage,
+                self._local_tasks_by_id,
+                today,
+            )
+        )
+        self._refresh_tracking_info()
 
     def _report_items_with_gitlab_updates(self, since_date: date) -> list[GitLabIssue]:
         """Board items plus issues/MRs updated on or after since_date (incl. closed)."""
@@ -1034,16 +1068,25 @@ class TrackerWindow(QMainWindow):
             )
         )
 
-    def _start_today_total_scan(self) -> None:
+    def _start_today_total_scan(self, force_refetch: bool = False) -> None:
         """Start a background scan of today's spent time across all recently-updated items."""
+        if force_refetch:
+            self._scan_force_refetch_next = True
         if self._scan_thread is not None and self._scan_thread.isRunning():
             self._scan_restart_requested = True
             return
 
+        want_force = self._scan_force_refetch_next
+        self._scan_force_refetch_next = False
+
         self._today_scan_total_seconds = 0
         today_day = datetime.now().date().isoformat()
         self._today_scan_day = today_day
-        self._today_scan_cache = self._storage.load_today_scan_cache(today_day)
+        if want_force:
+            self._today_scan_cache = {}
+            self._storage.save_today_scan_cache(today_day, {})
+        else:
+            self._today_scan_cache = self._storage.load_today_scan_cache(today_day)
         self._today_total_seconds = sum(int(entry.get("total", 0) or 0) for entry in self._today_scan_cache.values())
         self._today_total_seconds += sum(
             seconds
@@ -1108,11 +1151,22 @@ class TrackerWindow(QMainWindow):
         thread.finished.connect(self._on_sync_finished)
         thread.finished.connect(thread.deleteLater)
         self._sync_worker_thread = thread
+        self._update_interaction_lock()
         thread.start()
 
     def _on_sync_finished(self) -> None:
         """Clear sync thread reference after completion."""
         self._sync_worker_thread = None
+        self._update_interaction_lock()
+
+    def _update_interaction_lock(self) -> None:
+        """Lock board interactions while refresh/sync mutates board data."""
+        sync_running = self._sync_worker_thread is not None and self._sync_worker_thread.isRunning()
+        busy = self._refresh_in_progress or sync_running
+        self._board_scroll.setEnabled(not busy)
+        self._board_selector.setEnabled(not busy)
+        self._add_column_button.setEnabled(not busy)
+        self._add_local_task_button.setEnabled(not busy)
 
     def _find_issue(self, project_id: int | None, iid: int | None) -> GitLabIssue | None:
         if project_id is None or iid is None:

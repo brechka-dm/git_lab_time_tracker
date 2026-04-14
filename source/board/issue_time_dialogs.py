@@ -68,8 +68,7 @@ def show_issue_work_sessions(
     payload: dict,
     client: GitLabClient,
     storage: AppStorage,
-    spent_events_cache: dict[tuple[str, int, int], list[dict]],
-    restart_today_scan: Callable[[], None],
+    on_gitlab_sessions_saved: Callable[[int, int], None],
     show_status_message: Callable[[str, int], None],
 ) -> None:
     """Show and optionally edit work sessions for local task or issue."""
@@ -128,6 +127,7 @@ def show_issue_work_sessions(
                 "started_at": float(started_at),
                 "finished_at": float(finished_at),
                 "duration_seconds": float(duration),
+                "note_id": int(note_id),
             }
         )
     sessions.sort(key=lambda item: item["started_at"])
@@ -139,18 +139,15 @@ def show_issue_work_sessions(
     if not dialog.has_changes():
         return
 
-    updated_ranges = dialog.get_values()
-    for started, finished in updated_ranges:
+    updated_rows = dialog.get_rows()
+    for _, started, finished in updated_rows:
         if finished <= started:
             QMessageBox.warning(parent, "Work Sessions", "End time must be greater than start time.")
             return
 
     try:
-        client.apply_issue_work_session_edits(project_id, issue_iid, original_rows, updated_ranges)
-        cache_key = ("issue", project_id, issue_iid)
-        if cache_key in spent_events_cache:
-            del spent_events_cache[cache_key]
-        restart_today_scan()
+        client.apply_issue_work_session_edits(project_id, issue_iid, original_rows, updated_rows)
+        on_gitlab_sessions_saved(project_id, issue_iid)
         show_status_message(f"Work sessions saved for issue #{issue_iid}", 5000)
     except Exception as error:  # noqa: BLE001
         QMessageBox.warning(parent, "Work Sessions", f"Failed to save sessions:\n{error}")

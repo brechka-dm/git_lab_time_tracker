@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import sys
 import threading
 import traceback
@@ -9,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 _CRASH_LOG_NAME = "crash_report.txt"
+_FAULT_HANDLER_STREAM = None
 
 
 def crash_report_path(exe_dir: Path) -> Path:
@@ -44,6 +46,7 @@ def append_crash_exception(
 
 def install_crash_hooks(exe_dir: Path) -> None:
     """Log uncaught exceptions from the main thread and from worker threads."""
+    _install_fault_handler(exe_dir)
     prev_thread_hook = threading.excepthook
 
     def _main_excepthook(
@@ -79,3 +82,19 @@ def install_crash_hooks(exe_dir: Path) -> None:
         prev_thread_hook(args)
 
     threading.excepthook = _thread_excepthook
+
+
+def _install_fault_handler(exe_dir: Path) -> None:
+    """Enable faulthandler to capture hard crashes (segfault/abort) in crash log."""
+    global _FAULT_HANDLER_STREAM
+    if _FAULT_HANDLER_STREAM is not None:
+        return
+    try:
+        stream = crash_report_path(exe_dir).open("a", encoding="utf-8")
+    except OSError:
+        return
+    _FAULT_HANDLER_STREAM = stream
+    try:
+        faulthandler.enable(file=stream, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass

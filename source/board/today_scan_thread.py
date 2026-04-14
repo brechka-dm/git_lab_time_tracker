@@ -11,6 +11,24 @@ from gitlab_client import GitLabClient
 from models import GitLabIssue
 
 
+def spent_events_total_for_calendar_day(events: list, day: date) -> int:
+    """Sum ``duration_seconds`` for events whose ``finished_at`` falls on ``day`` (same rules as today scan)."""
+    total = 0
+    for event in events:
+        finished_str = event.get("finished_at")
+        if not isinstance(finished_str, str):
+            continue
+        if int(event.get("duration_seconds", 0) or 0) <= 0:
+            continue
+        normalized = finished_str.strip().replace("Z", "+00:00")
+        try:
+            if datetime.fromisoformat(normalized).date() == day:
+                total += int(event.get("duration_seconds", 0) or 0)
+        except ValueError:
+            continue
+    return total
+
+
 class TodayScanThread(QThread):
     """Background thread that scans today's spent time across all recently-updated items."""
 
@@ -73,24 +91,7 @@ class TodayScanThread(QThread):
             events = self._client.get_spent_time_events(
                 item.item_type, item.project_id, item.iid, since_date=self._today
             )
-            item_total = sum(
-                int(event.get("duration_seconds", 0) or 0)
-                for event in events
-                if self._is_today_event(event)
-            )
+            item_total = spent_events_total_for_calendar_day(events, self._today)
             return (item.item_type, item.project_id, item.iid, events, item_total)
         except Exception:  # noqa: BLE001
             return None
-
-    def _is_today_event(self, event: dict) -> bool:
-        """Return True if the event's finished_at timestamp falls on today's date."""
-        finished_str = event.get("finished_at")
-        if not isinstance(finished_str, str):
-            return False
-        if int(event.get("duration_seconds", 0) or 0) <= 0:
-            return False
-        normalized = finished_str.strip().replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(normalized).date() == self._today
-        except ValueError:
-            return False
