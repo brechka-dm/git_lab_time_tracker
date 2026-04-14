@@ -68,6 +68,7 @@ def run_daily_report(
     progress.setMinimumDuration(0)
     gitlab_failures: list[str] = []
     issue_totals: dict[tuple[str, int, int], int] = {}
+    report_cache: dict[tuple[str, int, int], list[dict]] = {}
     for index, issue in enumerate(report_items, start=1):
         progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(report_items)})...")
         progress.setValue(index - 1)
@@ -75,7 +76,7 @@ def run_daily_report(
         if progress.wasCanceled():
             return
 
-        total_seconds, error = collect_daily_totals(target_date, issue, spent_events_cache, load_events)
+        total_seconds, error = collect_daily_totals(target_date, issue, report_cache, load_events)
         if error is not None:
             gitlab_failures.append(error)
             progress.setValue(index)
@@ -163,6 +164,7 @@ def run_period_report(
     progress.setMinimumDuration(0)
     gitlab_failures: list[str] = []
     grouped: dict[str, dict[str, int]] = {}
+    report_cache: dict[tuple[str, int, int], list[dict]] = {}
     for index, issue in enumerate(report_items, start=1):
         progress.setLabelText(f"Loading events for #{issue.iid} ({index}/{len(report_items)})...")
         progress.setValue(index - 1)
@@ -174,7 +176,7 @@ def run_period_report(
             start_date,
             end_date,
             issue,
-            spent_events_cache,
+            report_cache,
             load_events,
         )
         if error is not None:

@@ -494,9 +494,11 @@ class GitLabClient:
 
 def _parse_duration_to_seconds(text: str) -> int:
     total = 0
-    for value, unit in re.findall(r"(\d+)\s*([hms])", text.lower()):
+    for value, unit in re.findall(r"(\d+)\s*([dhms])", text.lower()):
         amount = int(value)
-        if unit == "h":
+        if unit == "d":
+            total += amount * 8 * 3600
+        elif unit == "h":
             total += amount * 3600
         elif unit == "m":
             total += amount * 60
