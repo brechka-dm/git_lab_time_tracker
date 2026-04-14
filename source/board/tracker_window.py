@@ -305,19 +305,18 @@ class TrackerWindow(QMainWindow):
             for kind, entry in self._merge_column_card_order(label, grouped[label], local_for_column):
                 if kind == "gitlab":
                     issue = entry
-                    card = QListWidgetItem(f"#{issue.iid} {issue.title}")
                     issue_payload = asdict(issue)
                     issue_payload["is_local"] = False
+                    card = QListWidgetItem(self._decorate_card_text(f"#{issue.iid} {issue.title}", issue_payload))
                     card.setData(Qt.ItemDataRole.UserRole, issue_payload)
                     self._apply_card_highlight(card, issue_payload)
                     column.list_widget.addItem(card)
                 else:
                     task = entry
-                    local_card = QListWidgetItem(f"LOCAL {task.title}")
-                    local_card.setData(Qt.ItemDataRole.UserRole, local_task_to_payload(task))
-                    local_payload = local_card.data(Qt.ItemDataRole.UserRole)
-                    if isinstance(local_payload, dict):
-                        self._apply_card_highlight(local_card, local_payload)
+                    local_payload = local_task_to_payload(task)
+                    local_card = QListWidgetItem(self._decorate_card_text(f"LOCAL {task.title}", local_payload))
+                    local_card.setData(Qt.ItemDataRole.UserRole, local_payload)
+                    self._apply_card_highlight(local_card, local_payload)
                     column.list_widget.addItem(local_card)
 
     def _on_issue_moved(self, payload: dict, target_label: str) -> None:
@@ -1208,6 +1207,12 @@ class TrackerWindow(QMainWindow):
         project_id = int(payload.get("project_id", 0))
         iid = int(payload.get("iid", 0))
         return f"{project_id}:{iid}" if project_id > 0 and iid > 0 else ""
+
+    def _decorate_card_text(self, base_text: str, payload: dict) -> str:
+        key = self._payload_card_key(payload)
+        if key and key in self._highlighted_cards:
+            return f"★ {base_text}"
+        return base_text
 
     def _is_review_issue(self, issue: GitLabIssue) -> bool:
         current_user_id = self._client.user_id
